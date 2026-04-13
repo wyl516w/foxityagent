@@ -15,6 +15,7 @@ from agent_studio.core.models import (
     ControlActionPayload,
     ControlActionResult,
     CreateConversationRequest,
+    DeleteConversationResponse,
     CreateTaskAgentRequest,
     CreateWorkflowTaskRequest,
     ElementLookupRequest,
@@ -256,6 +257,22 @@ def build_router(
         state.update_ui_state(UiStatePayload(current_conversation_id=summary.conversation_id))
         return conversation_service.get_history(summary.conversation_id)
 
+    @router.delete(
+        "/conversations/{conversation_id}",
+        response_model=DeleteConversationResponse,
+    )
+    async def delete_conversation(conversation_id: str) -> DeleteConversationResponse:
+        _require_conversation_service(conversation_service)
+        try:
+            response = conversation_service.delete_conversation(conversation_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        ui_state = state.get_ui_state()
+        if ui_state.current_conversation_id == conversation_id:
+            state.update_ui_state(UiStatePayload(current_conversation_id=None))
+        state.append_event(f"Conversation deleted: {conversation_id}")
+        return response
+
     @router.get(
         "/conversations/{conversation_id}",
         response_model=ConversationHistoryResponse,
@@ -291,14 +308,12 @@ def build_router(
     async def chat(payload: ChatRequest) -> ChatResponse:
         try:
             conversation_id = payload.conversation_id
+            request_attachments = payload.attachments
             seed_text = (
                 payload.message
-                or _first_attachment_label(payload.attachments)
+                or _first_attachment_label(request_attachments)
                 or "Review the current desktop state and complete the requested goal."
             )
-            latest_image_path = _latest_attachment_path(payload.attachments)
-            if latest_image_path:
-                state.update_ui_state(UiStatePayload(latest_capture_path=latest_image_path))
             if conversation_service is not None:
                 summary = conversation_service.ensure_conversation(
                     conversation_id=payload.conversation_id,
@@ -308,13 +323,24 @@ def build_router(
                 state.update_ui_state(
                     UiStatePayload(current_conversation_id=conversation_id)
                 )
+                try:
+                    request_attachments = conversation_service.materialize_attachments_for_conversation(
+                        conversation_id=conversation_id,
+                        attachments=payload.attachments,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+            latest_image_path = _latest_attachment_path(request_attachments)
+            if latest_image_path:
+                state.update_ui_state(UiStatePayload(latest_capture_path=latest_image_path))
+            request_payload = payload.model_copy(update={"attachments": request_attachments})
             user_message = None
             if conversation_service is not None and conversation_id is not None:
                 user_message = conversation_service.append_message(
                     conversation_id=conversation_id,
                     role="user",
                     content=payload.message,
-                    attachments=_attachments_for_storage(payload.attachments),
+                    attachments=_attachments_for_storage(request_attachments),
                 )
             task: WorkflowTaskDetail | None = None
             primary_failure_reason: str | None = None
@@ -355,7 +381,7 @@ def build_router(
                             task = refreshed_task
                     else:
                         task_response = _build_chat_task_response(
-                            payload=payload,
+                            payload=request_payload,
                             conversation_id=conversation_id,
                             task=task,
                             config=config,
@@ -391,7 +417,7 @@ def build_router(
 
             try:
                 response = await model_router.chat(
-                    payload.model_copy(update={"conversation_id": conversation_id})
+                    request_payload.model_copy(update={"conversation_id": conversation_id})
                 )
             except Exception as exc:
                 if primary_failure_reason is not None:

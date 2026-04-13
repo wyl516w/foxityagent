@@ -141,28 +141,60 @@ class SQLiteStore:
         self,
         conversation_id: str,
         title: str,
+        metadata: dict[str, Any] | None = None,
     ) -> ConversationSummary:
         now = datetime.now(timezone.utc).isoformat()
         with self._lock, self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO conversations (id, title, metadata_json, created_at, updated_at)
-                VALUES (?, ?, '{}', ?, ?)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (conversation_id, title, now, now),
+                (
+                    conversation_id,
+                    title,
+                    json.dumps(metadata or {}, ensure_ascii=True),
+                    now,
+                    now,
+                ),
             )
             connection.commit()
         return self.get_conversation_summary(conversation_id)
+
+    def update_conversation_metadata(
+        self,
+        conversation_id: str,
+        metadata: dict[str, Any],
+    ) -> ConversationSummary:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE conversations
+                SET metadata_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    json.dumps(metadata, ensure_ascii=True),
+                    now,
+                    conversation_id,
+                ),
+            )
+            connection.commit()
+        summary = self.get_conversation_summary(conversation_id)
+        if summary is None:
+            raise ValueError(f"Conversation {conversation_id} was not found.")
+        return summary
 
     def get_conversation_summary(self, conversation_id: str) -> ConversationSummary | None:
         with self._lock, self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT c.id, c.title, c.created_at, c.updated_at, COUNT(m.id) AS message_count
+                SELECT c.id, c.title, c.metadata_json, c.created_at, c.updated_at, COUNT(m.id) AS message_count
                 FROM conversations c
                 LEFT JOIN conversation_messages m ON m.conversation_id = c.id
                 WHERE c.id = ?
-                GROUP BY c.id, c.title, c.created_at, c.updated_at
+                GROUP BY c.id, c.title, c.metadata_json, c.created_at, c.updated_at
                 """,
                 (conversation_id,),
             ).fetchone()
@@ -174,16 +206,62 @@ class SQLiteStore:
         with self._lock, self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT c.id, c.title, c.created_at, c.updated_at, COUNT(m.id) AS message_count
+                SELECT c.id, c.title, c.metadata_json, c.created_at, c.updated_at, COUNT(m.id) AS message_count
                 FROM conversations c
                 LEFT JOIN conversation_messages m ON m.conversation_id = c.id
-                GROUP BY c.id, c.title, c.created_at, c.updated_at
+                GROUP BY c.id, c.title, c.metadata_json, c.created_at, c.updated_at
                 ORDER BY c.updated_at DESC
                 LIMIT ?
                 """,
                 (limit,),
             ).fetchall()
         return [self._row_to_conversation_summary(row) for row in rows]
+
+    def delete_conversation(self, conversation_id: str) -> bool:
+        with self._lock, self._connect() as connection:
+            deleted = connection.execute(
+                """
+                DELETE FROM conversations
+                WHERE id = ?
+                """,
+                (conversation_id,),
+            ).rowcount
+            connection.commit()
+        return bool(deleted)
+
+    def delete_tasks_for_conversation(self, conversation_id: str) -> int:
+        with self._lock, self._connect() as connection:
+            try:
+                deleted = connection.execute(
+                    """
+                    DELETE FROM tasks
+                    WHERE json_extract(payload_json, '$.conversation_id') = ?
+                    """,
+                    (conversation_id,),
+                ).rowcount
+            except sqlite3.OperationalError:
+                rows = connection.execute(
+                    """
+                    SELECT id, payload_json
+                    FROM tasks
+                    """
+                ).fetchall()
+                task_ids = [
+                    str(row["id"])
+                    for row in rows
+                    if json.loads(row["payload_json"]).get("conversation_id") == conversation_id
+                ]
+                deleted = 0
+                for task_id in task_ids:
+                    deleted += connection.execute(
+                        """
+                        DELETE FROM tasks
+                        WHERE id = ?
+                        """,
+                        (task_id,),
+                    ).rowcount
+            connection.commit()
+        return int(deleted or 0)
 
     def update_conversation_title(self, conversation_id: str, title: str) -> ConversationSummary:
         now = datetime.now(timezone.utc).isoformat()
@@ -521,9 +599,13 @@ class SQLiteStore:
 
     @staticmethod
     def _row_to_conversation_summary(row: sqlite3.Row) -> ConversationSummary:
+        metadata = json.loads(row["metadata_json"] or "{}")
         return ConversationSummary(
             conversation_id=row["id"],
             title=row["title"],
+            sandbox_dir=metadata.get("sandbox_dir")
+            if isinstance(metadata.get("sandbox_dir"), str)
+            else None,
             message_count=row["message_count"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],

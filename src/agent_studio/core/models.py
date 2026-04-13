@@ -307,6 +307,7 @@ class AppSettingsUpdateRequest(BaseModel):
 class ConversationSummary(BaseModel):
     conversation_id: str
     title: str
+    sandbox_dir: str | None = None
     message_count: int = 0
     created_at: str
     updated_at: str
@@ -332,6 +333,11 @@ class ConversationHistoryResponse(BaseModel):
 
 class CreateConversationRequest(BaseModel):
     title: str | None = None
+
+
+class DeleteConversationResponse(BaseModel):
+    conversation_id: str
+    deleted: bool = True
 
 
 class TaskStatus(str, Enum):

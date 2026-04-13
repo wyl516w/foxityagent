@@ -520,6 +520,83 @@ def test_chat_route_falls_back_when_autonomous_response_is_low_signal() -> None:
         shutil.rmtree(test_dir, ignore_errors=True)
 
 
+def test_delete_conversation_removes_associated_tasks() -> None:
+    test_dir = _make_test_dir()
+    try:
+        config = AppConfig(database_path=test_dir / "agent_studio.db")
+        store = SQLiteStore(
+            database_path=config.database_path,
+            event_retention_limit=config.event_retention_limit,
+        )
+        store.initialize()
+        state = SharedState(config=config, store=store)
+        permission_manager = PermissionManager(state=state)
+        input_controller = NoopInputController(
+            state=state,
+            permission_manager=permission_manager,
+        )
+        perception_service = _StubPerceptionService()
+        model_router = _StubAutonomousModelRouter(
+            responses=[
+                '{"status":"complete","summary":"Finished quickly."}',
+            ]
+        )
+        workflow_service = WorkflowService(
+            store=store,
+            state=state,
+            perception_service=perception_service,
+            input_controller=input_controller,
+            permission_manager=permission_manager,
+            system_service=SystemService(
+                config=config,
+                perception_service=perception_service,
+                state=state,
+                model_router=model_router,
+            ),
+            model_router=model_router,
+        )
+
+        app = FastAPI()
+        app.include_router(
+            build_router(
+                config=config,
+                state=state,
+                model_router=model_router,
+                permission_manager=permission_manager,
+                input_controller=input_controller,
+                conversation_service=ConversationService(store=store),
+                perception_service=perception_service,
+                workflow_service=workflow_service,
+                system_service=SystemService(
+                    config=config,
+                    perception_service=perception_service,
+                    state=state,
+                    model_router=model_router,
+                ),
+            )
+        )
+        client = TestClient(app)
+
+        created = client.post(
+            "/api/chat",
+            json={"message": "Create and then delete this conversation task."},
+        )
+        assert created.status_code == 200
+        payload = created.json()
+        conversation_id = payload["conversation_id"]
+        task_id = payload["task_id"]
+        assert task_id
+
+        deleted = client.delete(f"/api/conversations/{conversation_id}")
+        assert deleted.status_code == 200
+
+        assert store.get_conversation_summary(conversation_id) is None
+        assert store.get_task(task_id) is None
+        assert store.list_tasks(conversation_id=conversation_id) == []
+    finally:
+        shutil.rmtree(test_dir, ignore_errors=True)
+
+
 def test_workflow_task_routes_create_and_run_tasks() -> None:
     test_dir = _make_test_dir()
     try:

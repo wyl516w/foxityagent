@@ -2,6 +2,12 @@
 
 ## 2026-04-13
 
+- Added conversation deletion support end-to-end (`DELETE /api/conversations/{id}`) so a conversation now removes its persisted conversation row, cascaded messages, and associated task records from SQLite.
+- Added per-conversation sandbox directories in `ConversationService` and `SQLiteStore` metadata (`conversation.sandbox_dir`), and surfaced the sandbox path in conversation payloads and UI.
+- Hardened chat attachment handling so `/api/chat` materializes incoming attachments into the active conversation sandbox before storage/model routing, avoiding arbitrary raw file-path reuse across conversations.
+- Updated `src/agent_studio/ui/main_window.py` and `src/agent_studio/ui/i18n.py` with a delete-conversation UI action, confirmation flow, and sandbox-aware attachment rendering.
+- Added regression coverage in `tests/test_conversation_history_api.py` and `tests/test_workflow_routes.py` for sandbox materialization, conversation deletion, and associated task cleanup.
+
 - Completed phase G / step 5 by wiring explicit message-to-run mapping in `src/agent_studio/ui/main_window.py` with internal links (`task://{task_id}`, `message://{message_id}`), bidirectional jump behavior, and visible left-side message highlighting based on `linked_task_id` and `source_message_id`.
 - Hardened `/api/chat` in `src/agent_studio/api/routes.py` so autonomous execution remains the primary path but no longer a single point of failure: task-create/task-run errors and low-signal autonomous outputs now trigger direct `model_router.chat(...)` fallback while preserving conversation history and task linkage metadata.
 - Added regression coverage in `tests/test_workflow_routes.py` for autonomous failure fallback, low-signal fallback, task metadata retention, conversation message linkage, and `source_message_id` consistency in `/api/conversations/{id}/tasks/details`.

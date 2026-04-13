@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass
 from html import escape
@@ -235,9 +235,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.current_conversation_label.setProperty("muted", True)
         self.current_conversation_label.setWordWrap(True)
         self.new_conversation_button = QtWidgets.QPushButton()
+        self.delete_conversation_button = QtWidgets.QPushButton()
         self.reload_conversations_button = QtWidgets.QPushButton()
         header.addWidget(self.current_conversation_label, stretch=1)
         header.addWidget(self.new_conversation_button)
+        header.addWidget(self.delete_conversation_button)
         header.addWidget(self.reload_conversations_button)
         layout.addLayout(header)
 
@@ -343,6 +345,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings_button.clicked.connect(self.open_settings_dialog)
         self.refresh_button.clicked.connect(self.refresh_all)
         self.new_conversation_button.clicked.connect(self.create_conversation)
+        self.delete_conversation_button.clicked.connect(self.delete_current_conversation)
         self.reload_conversations_button.clicked.connect(self.refresh_all)
         self.conversation_list.currentItemChanged.connect(self._on_conversation_selected)
         self.attach_images_button.clicked.connect(self.choose_chat_attachments)
@@ -378,6 +381,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.controller_runtime_label.setText(self._t("controller"))
         self.chat_group.setTitle(self._t("conversation"))
         self.new_conversation_button.setText(self._t("new_conversation"))
+        self.delete_conversation_button.setText(self._t("delete_conversation"))
         self.reload_conversations_button.setText(self._t("reload_history"))
         self.prompt_group.setTitle(self._t("prompt"))
         self.attach_images_button.setText(self._t("attach_images"))
@@ -589,9 +593,12 @@ class MainWindow(QtWidgets.QMainWindow):
             title = str(conversation.get("title", conversation_id))
             updated_at = self._compact_timestamp(conversation.get("updated_at"))
             message_count = int(conversation.get("message_count", 0))
+            sandbox_dir = str(conversation.get("sandbox_dir") or "").strip()
             item = QtWidgets.QListWidgetItem(f"{title}\n{updated_at} | {message_count}")
             item.setData(QtCore.Qt.ItemDataRole.UserRole, conversation_id)
-            item.setToolTip(conversation_id)
+            item.setToolTip(
+                f"{conversation_id}\nSandbox: {sandbox_dir}" if sandbox_dir else conversation_id
+            )
             self.conversation_list.addItem(item)
 
         target_id = self.current_conversation_id or self.loaded_conversation_id
@@ -654,7 +661,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if pending in self._task_payloads:
                 target_id = pending
             else:
-                self.statusBar().showMessage(f"未找到对应执行 {pending}", 3500)
+                self.statusBar().showMessage(f"鏈壘鍒板搴旀墽琛?{pending}", 3500)
         if target_id is None and ordered_tasks and self.selected_task_id is None:
             target_id = str(ordered_tasks[0].get("task_id"))
         self._rebuild_task_tabs(ordered_tasks, target_id)
@@ -745,7 +752,7 @@ class MainWindow(QtWidgets.QMainWindow):
             f"<tr><td><b>{escape(self._t('task_status'))}</b></td><td>{status}</td></tr>",
             f"<tr><td><b>{escape(self._t('task_agents'))}</b></td><td>{len(agents)}</td></tr>",
             f"<tr><td><b>{escape(self._t('task_last_message'))}</b></td><td>{last_message}</td></tr>",
-            f"<tr><td><b>触发消息</b></td><td>{source_mapping_html}</td></tr>",
+            f"<tr><td><b>Trigger Message</b></td><td>{source_mapping_html}</td></tr>",
             "</table>",
         ]
 
@@ -830,7 +837,13 @@ class MainWindow(QtWidgets.QMainWindow):
         conversation = payload.get("conversation", {})
         messages = payload.get("messages", [])
         title = escape(str(conversation.get("title", self._t("conversation"))))
+        sandbox_dir = str(conversation.get("sandbox_dir") or "").strip()
         blocks: list[str] = [f"<h3>{title}</h3>"]
+        if sandbox_dir:
+            blocks.append(
+                "<p style='color:#60708a;margin-top:-6px;margin-bottom:12px;'>"
+                f"Sandbox: {escape(sandbox_dir)}</p>"
+            )
         for message in messages:
             role = str(message.get("role", "assistant"))
             role_label = self._t("chat_role_user" if role == "user" else "chat_role_assistant")
@@ -843,7 +856,10 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             border_color = "#2563eb" if is_highlighted else "#d8deea"
             background = "#eff6ff" if is_highlighted else "#ffffff"
-            attachments = self._render_message_attachments(message.get("attachments", []))
+            attachments = self._render_message_attachments(
+                message.get("attachments", []),
+                sandbox_dir=sandbox_dir or None,
+            )
             mapping = self._render_message_task_mapping(
                 message_id=message_id,
                 linked_task_id=linked_task_id,
@@ -872,17 +888,17 @@ class MainWindow(QtWidgets.QMainWindow):
             task_link = build_internal_link(TASK_LINK_SCHEME, linked_task_id)
             return (
                 "<div style='margin-top:10px;color:#1e3a8a;'>"
-                f"<b>对应执行</b>: <a href='{escape(task_link)}'>{escape(linked_task_id)}</a>"
+                f"<b>Linked Run</b>: <a href='{escape(task_link)}'>{escape(linked_task_id)}</a>"
                 "</div>"
             )
         if not message_id:
             return ""
-        return "<div style='margin-top:10px;color:#60708a;'><b>对应执行</b>: 无映射</div>"
+        return "<div style='margin-top:10px;color:#60708a;'><b>Linked Run</b>: No mapping</div>"
 
     def _render_task_source_mapping(self, task: dict) -> str:
         source_message_id = str(task.get("source_message_id") or "").strip()
         if not source_message_id:
-            return "无映射"
+            return "No mapping"
         message_link = build_internal_link(MESSAGE_LINK_SCHEME, source_message_id)
         preview = str(task.get("source_message_preview") or "").strip()
         preview_html = (
@@ -895,19 +911,42 @@ class MainWindow(QtWidgets.QMainWindow):
             f"{preview_html}"
         )
 
-    def _render_message_attachments(self, attachments: list[dict]) -> str:
+    def _render_message_attachments(
+        self,
+        attachments: list[dict],
+        *,
+        sandbox_dir: str | None = None,
+    ) -> str:
         if not attachments:
             return ""
+        resolved_sandbox = (
+            Path(sandbox_dir).expanduser().resolve()
+            if isinstance(sandbox_dir, str) and sandbox_dir
+            else None
+        )
         parts: list[str] = ["<div style='margin-top:10px;'>"]
         for attachment in attachments:
             name = str(attachment.get("name") or "image")
             image_path = attachment.get("image_path")
             if isinstance(image_path, str) and image_path:
                 try:
-                    uri = Path(image_path).resolve().as_uri()
+                    resolved_path = Path(image_path).expanduser().resolve()
                 except ValueError:
-                    uri = ""
-                if uri:
+                    resolved_path = None
+                if (
+                    resolved_path is not None
+                    and resolved_sandbox is not None
+                    and not resolved_path.is_relative_to(resolved_sandbox)
+                ):
+                    parts.append(
+                        (
+                            "<div style='margin-top:8px;color:#b45309;'>"
+                            f"{escape(name)} (outside sandbox blocked)</div>"
+                        )
+                    )
+                    continue
+                if resolved_path is not None:
+                    uri = resolved_path.as_uri()
                     parts.append(
                         (
                             f"<div style='margin-top:8px;'><a href='{uri}'>{escape(name)}</a><br>"
@@ -935,7 +974,13 @@ class MainWindow(QtWidgets.QMainWindow):
             conversation = self._loaded_conversation_payload.get("conversation", {})
             title = str(conversation.get("title", self._t("conversation_none")))
             count = int(conversation.get("message_count", 0))
-            self.current_conversation_label.setText(f"{title} | {count}")
+            sandbox_dir = str(conversation.get("sandbox_dir") or "").strip()
+            if sandbox_dir:
+                self.current_conversation_label.setText(
+                    f"{title} | {count} | Sandbox: {sandbox_dir}"
+                )
+            else:
+                self.current_conversation_label.setText(f"{title} | {count}")
             return
         if self.current_conversation_id:
             self.current_conversation_label.setText(self.current_conversation_id)
@@ -1063,6 +1108,65 @@ class MainWindow(QtWidgets.QMainWindow):
             error_context="Conversation creation failed",
         )
 
+    def delete_current_conversation(self) -> None:
+        conversation_id = (self.current_conversation_id or "").strip()
+        if not conversation_id:
+            self.statusBar().showMessage(self._t("conversation_none"), 3000)
+            return
+        confirm = QtWidgets.QMessageBox.question(
+            self,
+            self._t("status_conversation_delete_confirm_title"),
+            self._t("status_conversation_delete_confirm_text"),
+            QtWidgets.QMessageBox.StandardButton.Yes
+            | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if confirm != QtWidgets.QMessageBox.StandardButton.Yes:
+            self.statusBar().showMessage(
+                self._t("status_conversation_delete_cancelled"),
+                2500,
+            )
+            return
+        encoded_id = quote(conversation_id, safe="")
+        self._queue_request(
+            f"conversation:delete:{conversation_id}",
+            f"/api/conversations/{encoded_id}",
+            method="DELETE",
+            on_success=lambda payload, cid=conversation_id: self._on_conversation_deleted(
+                payload,
+                deleted_conversation_id=cid,
+            ),
+            on_failure=self._on_conversation_delete_failure,
+            error_context="Conversation deletion failed",
+        )
+
+    def _on_conversation_deleted(
+        self,
+        payload: dict,
+        *,
+        deleted_conversation_id: str,
+    ) -> None:
+        deleted_id = str(payload.get("conversation_id") or deleted_conversation_id)
+        if self.current_conversation_id == deleted_id:
+            self.current_conversation_id = None
+        if self.loaded_conversation_id == deleted_id:
+            self.loaded_conversation_id = None
+            self._loaded_conversation_payload = None
+        self.selected_task_id = None
+        self._highlighted_message_id = None
+        self._pending_task_link_id = None
+        self._render_empty_chat()
+        self._rebuild_task_tabs([], None)
+        self.refresh_settings()
+        self.refresh_conversations()
+        self.statusBar().showMessage(self._t("status_conversation_deleted"), 3500)
+
+    def _on_conversation_delete_failure(self, error: str) -> None:
+        self.statusBar().showMessage(
+            f"{self._t('status_conversation_delete_failed')}: {error}",
+            6000,
+        )
+
     def _on_conversation_created(self, payload: dict) -> None:
         conversation = payload.get("conversation", {})
         conversation_id = str(conversation.get("conversation_id", ""))
@@ -1152,19 +1256,19 @@ class MainWindow(QtWidgets.QMainWindow):
             widget_task_id = widget.property("task_id") if widget is not None else None
             if widget_task_id == normalized:
                 self.task_tabs.setCurrentIndex(index)
-                self.statusBar().showMessage(f"已定位到对应执行 {normalized}", 3000)
+                self.statusBar().showMessage(f"Linked run selected: {normalized}", 3000)
                 return
         self._pending_task_link_id = normalized
         if self.current_conversation_id:
             self.load_conversation_tasks(self.current_conversation_id)
-        self.statusBar().showMessage(f"正在加载执行 {normalized}", 3000)
+        self.statusBar().showMessage(f"Loading linked run: {normalized}", 3000)
 
     def _focus_message_from_link(self, message_id: str) -> None:
         normalized = message_id.strip()
         if not normalized:
             return
         self._set_highlighted_message(normalized)
-        self.statusBar().showMessage(f"已定位到触发消息 {normalized}", 3000)
+        self.statusBar().showMessage(f"Trigger message located: {normalized}", 3000)
 
     def _set_highlighted_message(self, message_id: str | None) -> None:
         normalized = (message_id or "").strip() or None
@@ -1388,7 +1492,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _task_tab_label(self, task: dict) -> str:
         title = str(task.get("title", self._t("activity"))).strip() or self._t("activity")
         status = self._task_status_label(str(task.get("status", "draft")))
-        label = f"{status} · {title}"
+        label = f"{status} 路 {title}"
         return f"{label[:27]}..." if len(label) > 30 else label
 
     def _agent_tab_label(self, agent: dict) -> str:
@@ -1439,3 +1543,5 @@ class MainWindow(QtWidgets.QMainWindow):
             "<html><body style='font-family:Segoe UI;color:#172033;font-size:12px;line-height:1.55;'>"
             f"{content}</body></html>"
         )
+
+
