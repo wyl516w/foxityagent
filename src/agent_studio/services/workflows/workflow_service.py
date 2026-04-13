@@ -100,11 +100,7 @@ class WorkflowService:
         self,
         conversation_id: str,
     ) -> list[WorkflowTaskDetail]:
-        summaries = self._store.list_tasks(conversation_id=conversation_id)
-        details: list[WorkflowTaskDetail] = []
-        for summary in summaries:
-            details.append(await self.get_task(summary.task_id))
-        return details
+        return self._store.list_task_details(conversation_id=conversation_id)
 
     async def get_task(self, task_id: str) -> WorkflowTaskDetail:
         auto_resolved = await self._auto_resolve_pending_approval(task_id)

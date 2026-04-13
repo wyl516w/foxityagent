@@ -87,7 +87,13 @@ class BackendServer:
 
         self._thread = threading.Thread(target=self._server.run, daemon=True)
         self._thread.start()
-        self.wait_until_ready(timeout_seconds=8.0)
+        if not self.wait_until_ready(timeout_seconds=8.0):
+            self._server.should_exit = True
+            self._thread.join(timeout=5.0)
+            self._thread = None
+            message = "Backend server failed to become ready within 8 seconds."
+            self.state.append_event(message)
+            raise RuntimeError(message)
         self.state.append_event(
             f"Backend server started with {self.input_controller.controller_name} controller."
         )

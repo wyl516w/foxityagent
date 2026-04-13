@@ -1,6 +1,15 @@
-# Check Log
+﻿# Check Log
 
 ## 2026-04-13
+
+- Resolved the `git pull` merge conflicts in `实现计划.md`, `用户手册.md`, and `checklog.md` by keeping the local conversation-first product direction and rewriting the files cleanly.
+- Entered phase G / step 3 and updated `src/agent_studio/api/routes.py` so `/api/chat` now creates autonomous conversation tasks with the current configured provider settings instead of hardcoding the local Ollama route.
+- Updated `src/agent_studio/services/backend_server.py` so `BackendServer.start()` fails fast when `/api/health` does not become ready within eight seconds, instead of logging a false-success startup event.
+- Reduced event noise in `src/agent_studio/core/state.py` and `src/agent_studio/storage/sqlite_store.py` by removing the generic `UI state updated.` spam and by avoiding a database read-after-write for every appended event.
+- Added permission audit persistence in `src/agent_studio/services/automation/permission_manager.py` and `src/agent_studio/storage/sqlite_store.py`, so desktop-control decisions now land in the existing `permission_audit` table.
+- Optimized conversation task queries in `src/agent_studio/storage/sqlite_store.py` and `src/agent_studio/services/workflows/workflow_service.py` so conversation filters are pushed into SQLite and conversation detail loading no longer uses the earlier N+1 pattern.
+- Repaired test drift in `tests/test_system_service.py` and added regression coverage in `tests/test_backend_server.py`, `tests/test_permission_manager.py`, and `tests/test_workflow_routes.py` for fail-fast startup, permission-audit persistence, and provider-inheriting chat tasks.
+- Verified this round with `.venv\\Scripts\\python.exe -m py_compile`, `pytest -q tests/test_workflow_routes.py tests/test_system_service.py tests/test_permission_manager.py tests/test_backend_server.py` (`11 passed`), and `.venv\\Scripts\\python.exe -m ruff check src tests`.
 
 - Entered phase G / step 2 and replaced `src/agent_studio/ui/main_window.py` with a conversation-first main window.
 - Removed the old workflow-first panels and duplicate method definitions from `src/agent_studio/ui/main_window.py`, keeping only the conversation list, chat composer, session task tabs, agent tabs, inline approval controls, and recent events.
@@ -9,7 +18,7 @@
 - Added `_build_chat_task_response(...)` to `src/agent_studio/api/routes.py` so `/api/chat` returns a valid autonomous-task response when workflow execution is enabled.
 - Extended `tests/test_workflow_routes.py` with a regression test covering `/api/chat` when the workflow service is enabled, including automatic task creation inside a conversation.
 - Rewrote `实现计划.md` and `用户手册.md` to match the new stage status and the simplified chat-first UI.
-- Verified this round with `.venv\\Scripts\\python.exe -m py_compile`, `pytest -q tests/test_workflow_routes.py tests/test_conversation_history_api.py` (`6 passed`), and `.venv\\Scripts\\python.exe -m ruff check src tests`.
+- Verified phase G / step 2 with `.venv\\Scripts\\python.exe -m py_compile`, `pytest -q tests/test_workflow_routes.py tests/test_conversation_history_api.py` (`6 passed`), and `.venv\\Scripts\\python.exe -m ruff check src tests`.
 
 - Entered phase G / step 1 and rewrote `实现计划.md` to formally shift the project from a workflow-first prototype toward a conversation-driven desktop agent workbench.
 - Added two explicit planning tracks to `实现计划.md`: one for immediate code-governance cleanup and one for the product-level transition to a conversation-centered agent loop.
@@ -34,7 +43,3 @@
 - Completed phase B / step 4 with a runtime controller factory and a real Windows input controller.
 - Completed phase C / step 5 with screenshot capture, OCR, and text-based element lookup.
 - Completed phase C / step 6 with persisted workflow tasks, execution routes, UI language persistence, and the first task-oriented desktop shell.
-
-## Summary
-
-- Earlier detailed entries were consolidated into this cleaner stage log during phase G / step 2 so future changes can be tracked without the previous encoding-corrupted history.

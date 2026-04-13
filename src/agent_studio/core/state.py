@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from datetime import datetime
 from threading import RLock
 
 from agent_studio.core.config import AppConfig
@@ -76,14 +77,14 @@ class SharedState:
 
     def update_ui_state(self, payload: UiStatePayload) -> UiStatePayload:
         with self._lock:
-            self._ui = self._ui.model_copy(
+            updated_ui = self._ui.model_copy(
                 update=payload.model_dump(exclude_unset=True)
             )
+            if updated_ui == self._ui:
+                return self._ui.model_copy(deep=True)
+            self._ui = updated_ui
             if self._store is not None:
                 self._store.save_ui_state(self._ui)
-            self._append_event_locked(
-                "UI state updated."
-            )
             return self._ui.model_copy(deep=True)
 
     def get_recent_events(self) -> list[str]:
@@ -100,10 +101,7 @@ class SharedState:
 
     def _append_event_locked(self, message: str) -> None:
         if self._store is not None:
-            self._store.append_event(message)
-            formatted = self._store.load_recent_events(1)[0]
+            formatted = self._store.append_event(message)
         else:
-            from datetime import datetime
-
             formatted = f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
         self._recent_events.appendleft(formatted)

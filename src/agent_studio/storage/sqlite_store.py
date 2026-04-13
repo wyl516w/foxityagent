@@ -5,6 +5,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
+from typing import Any
 
 from agent_studio.core.models import (
     AutomationSettingsPayload,
@@ -72,7 +73,7 @@ class SQLiteStore:
     def save_ui_state(self, payload: UiStatePayload) -> None:
         self._save_json_setting("ui_state", payload.model_dump(mode="json"))
 
-    def append_event(self, message: str, event_type: str = "app") -> None:
+    def append_event(self, message: str, event_type: str = "app") -> str:
         now = datetime.now(timezone.utc).isoformat()
         with self._lock, self._connect() as connection:
             connection.execute(
@@ -83,6 +84,30 @@ class SQLiteStore:
                 (event_type, message, now),
             )
             self._prune_events(connection)
+            connection.commit()
+        return self._format_event(now, message)
+
+    def append_permission_audit(
+        self,
+        *,
+        action: str,
+        decision: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO permission_audit (action, decision, details_json, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    action,
+                    decision,
+                    json.dumps(details or {}, ensure_ascii=True),
+                    now,
+                ),
+            )
             connection.commit()
 
     def load_recent_events(self, limit: int) -> list[str]:
@@ -330,20 +355,16 @@ class SQLiteStore:
         limit: int = 100,
         conversation_id: str | None = None,
     ) -> list[WorkflowTaskSummary]:
-        with self._lock, self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT id, title, status, payload_json, created_at, updated_at
-                FROM tasks
-                ORDER BY updated_at DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
-        tasks = [self._row_to_task_summary(row) for row in rows]
-        if conversation_id is None:
-            return tasks
-        return [task for task in tasks if task.conversation_id == conversation_id]
+        rows = self._select_task_rows(limit=limit, conversation_id=conversation_id)
+        return [self._row_to_task_summary(row) for row in rows]
+
+    def list_task_details(
+        self,
+        limit: int = 100,
+        conversation_id: str | None = None,
+    ) -> list[WorkflowTaskDetail]:
+        rows = self._select_task_rows(limit=limit, conversation_id=conversation_id)
+        return [self._row_to_task_detail(row) for row in rows]
 
     def get_task_payload(self, task_id: str) -> dict | None:
         with self._lock, self._connect() as connection:
@@ -418,6 +439,40 @@ class SQLiteStore:
         connection.execute(
             f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"
         )
+
+    def _select_task_rows(
+        self,
+        *,
+        limit: int,
+        conversation_id: str | None,
+    ) -> list[sqlite3.Row]:
+        base_query = """
+            SELECT id, title, status, payload_json, created_at, updated_at
+            FROM tasks
+        """
+        with self._lock, self._connect() as connection:
+            if conversation_id is None:
+                return connection.execute(
+                    base_query + " ORDER BY updated_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            try:
+                return connection.execute(
+                    base_query
+                    + " WHERE json_extract(payload_json, '$.conversation_id') = ?"
+                    + " ORDER BY updated_at DESC LIMIT ?",
+                    (conversation_id, limit),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = connection.execute(
+                    base_query + " ORDER BY updated_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        return [
+            row
+            for row in rows
+            if json.loads(row["payload_json"]).get("conversation_id") == conversation_id
+        ]
 
     @staticmethod
     def _format_event(created_at: str, message: str) -> str:

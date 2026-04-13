@@ -230,6 +230,14 @@ def test_chat_route_creates_autonomous_task_when_workflow_service_is_enabled() -
         )
         store.initialize()
         state = SharedState(config=config, store=store)
+        state.update_provider_settings(
+            ProviderSettingsPayload(
+                provider=ProviderType.OPENAI_COMPATIBLE,
+                base_url="https://api.example.test/v1",
+                model="gpt-4.1-mini",
+                allow_mock_fallback=False,
+            )
+        )
         permission_manager = PermissionManager(state=state)
         input_controller = NoopInputController(
             state=state,
@@ -309,6 +317,9 @@ def test_chat_route_creates_autonomous_task_when_workflow_service_is_enabled() -
         assert task_details.status_code == 200
         detail_payload = task_details.json()
         assert detail_payload["tasks"][0]["task_id"] == payload["task_id"]
+        assert model_router.settings_history[0]["provider"] == "openai_compatible"
+        assert model_router.settings_history[0]["model"] == "gpt-4.1-mini"
+        assert model_router.settings_history[0]["base_url"] == "https://api.example.test/v1"
     finally:
         shutil.rmtree(test_dir, ignore_errors=True)
 

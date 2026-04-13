@@ -1,3 +1,4 @@
+import asyncio
 import subprocess
 
 from fastapi import FastAPI
@@ -22,11 +23,13 @@ def test_system_service_prepares_and_executes_python_script(monkeypatch) -> None
     perception_service = PerceptionService(config=config)
     service = SystemService(config=config, perception_service=perception_service)
 
-    preview = service.prepare_script_execution(
-        ScriptExecutionPrepareRequest(
-            script="import platform\nprint(platform.system())",
-            runtime="auto",
-            timeout_seconds=5.0,
+    preview = asyncio.run(
+        service.prepare_script_execution(
+            ScriptExecutionPrepareRequest(
+                script="import platform\nprint(platform.system())",
+                runtime="auto",
+                timeout_seconds=5.0,
+            )
         )
     )
 

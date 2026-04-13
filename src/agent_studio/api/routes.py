@@ -310,18 +310,14 @@ def build_router(
                     attachments=_attachments_for_storage(payload.attachments),
                 )
             if workflow_service is not None and conversation_id is not None:
+                provider_settings = state.get_provider_settings()
                 task_request = CreateWorkflowTaskRequest(
                     title=None,
                     conversation_id=conversation_id,
                     instruction=payload.message
                     or _first_attachment_label(payload.attachments)
                     or "Review the current desktop state and complete the requested goal.",
-                    model_assignment=AgentModelAssignment(
-                        provider=ProviderType.OLLAMA,
-                        model=config.default_local_model,
-                        base_url=config.ollama_base_url,
-                        assignment_reason="Chat tasks default to the local multimodal model.",
-                    ),
+                    model_assignment=_assignment_from_provider_settings(provider_settings),
                     autonomous=True,
                     max_iterations=8,
                     preferred_language="system",
@@ -342,7 +338,9 @@ def build_router(
                         content=response.content,
                     )
                 state.append_event(
-                    f"Chat created autonomous task {task.task_id} for conversation {conversation_id}."
+                    "Chat created autonomous task "
+                    f"{task.task_id} for conversation {conversation_id} using "
+                    f"{provider_settings.provider.value}/{provider_settings.model}."
                 )
                 return response
 
@@ -607,4 +605,18 @@ def _build_chat_task_response(
         vision_used=bool(payload.attachments),
         attachment_count=len(payload.attachments),
         latency_ms=0,
+    )
+
+
+def _assignment_from_provider_settings(
+    provider_settings: ProviderSettingsPayload,
+) -> AgentModelAssignment:
+    return AgentModelAssignment(
+        provider=provider_settings.provider,
+        model=provider_settings.model,
+        base_url=provider_settings.base_url,
+        assignment_reason=(
+            "Chat tasks inherit the current provider settings so the conversation route "
+            "stays aligned with the active model configuration."
+        ),
     )
