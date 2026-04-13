@@ -6,6 +6,7 @@ from agent_studio.core.models import (
     ChatImageAttachment,
     ConversationHistoryResponse,
     ConversationListResponse,
+    ConversationMessage,
     ConversationSummary,
 )
 from agent_studio.storage.sqlite_store import SQLiteStore
@@ -43,12 +44,20 @@ class ConversationService:
         role: str,
         content: str,
         attachments: list[ChatImageAttachment] | None = None,
-    ) -> None:
-        self._store.append_conversation_message(
+        linked_task_id: str | None = None,
+    ) -> ConversationMessage:
+        return self._store.append_conversation_message(
             conversation_id,
             role,
             content,
             attachments=attachments,
+            linked_task_id=linked_task_id,
+        )
+
+    def link_message_to_task(self, message_id: str, task_id: str) -> None:
+        self._store.update_conversation_message_task_link(
+            message_id=message_id,
+            task_id=task_id,
         )
 
     def list_conversations(self) -> ConversationListResponse:

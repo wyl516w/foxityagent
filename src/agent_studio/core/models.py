@@ -313,10 +313,12 @@ class ConversationSummary(BaseModel):
 
 
 class ConversationMessage(BaseModel):
+    message_id: str
     role: str
     content: str
     created_at: str
     attachments: list[ChatImageAttachment] = Field(default_factory=list)
+    linked_task_id: str | None = None
 
 
 class ConversationListResponse(BaseModel):
@@ -413,6 +415,8 @@ class CreateWorkflowTaskRequest(BaseModel):
     title: str | None = None
     conversation_id: str | None = None
     instruction: str = ""
+    source_message_id: str | None = None
+    source_message_preview: str | None = None
     model_assignment: AgentModelAssignment | None = None
     autonomous: bool = False
     max_iterations: int = Field(default=8, ge=1, le=24)
@@ -456,6 +460,8 @@ class WorkflowTaskSummary(BaseModel):
     title: str
     status: TaskStatus
     conversation_id: str | None = None
+    source_message_id: str | None = None
+    source_message_preview: str | None = None
     step_count: int
     agent_count: int = 0
     preferred_language: str = "system"
@@ -469,6 +475,8 @@ class WorkflowTaskDetail(BaseModel):
     title: str
     status: TaskStatus
     conversation_id: str | None = None
+    source_message_id: str | None = None
+    source_message_preview: str | None = None
     preferred_language: str = "system"
     steps: list[WorkflowStepDefinition] = Field(default_factory=list)
     results: list[WorkflowStepResult] = Field(default_factory=list)

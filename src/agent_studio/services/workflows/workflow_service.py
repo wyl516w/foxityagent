@@ -131,6 +131,8 @@ class WorkflowService:
         )
         payload = {
             "conversation_id": request.conversation_id,
+            "source_message_id": request.source_message_id,
+            "source_message_preview": request.source_message_preview,
             "preferred_language": preferred_language,
             "steps": [step.model_dump(mode="json") for step in request.steps],
             "results": [],

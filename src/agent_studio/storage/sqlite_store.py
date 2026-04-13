@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 from typing import Any
+from uuid import uuid4
 
 from agent_studio.core.models import (
     AutomationSettingsPayload,
@@ -39,6 +40,18 @@ class SQLiteStore:
                 table_name="conversation_messages",
                 column_name="attachments_json",
                 definition="TEXT NOT NULL DEFAULT '[]'",
+            )
+            self._ensure_column(
+                connection,
+                table_name="conversation_messages",
+                column_name="message_id",
+                definition="TEXT",
+            )
+            self._ensure_column(
+                connection,
+                table_name="conversation_messages",
+                column_name="linked_task_id",
+                definition="TEXT",
             )
             connection.commit()
 
@@ -195,8 +208,10 @@ class SQLiteStore:
         role: str,
         content: str,
         attachments: list[ChatImageAttachment] | None = None,
+        linked_task_id: str | None = None,
     ) -> ConversationMessage:
         now = datetime.now(timezone.utc).isoformat()
+        message_id = f"msg-{uuid4().hex[:12]}"
         attachment_payload = [
             attachment.model_dump(mode="json", exclude={"image_base64"})
             for attachment in (attachments or [])
@@ -206,18 +221,22 @@ class SQLiteStore:
                 """
                 INSERT INTO conversation_messages (
                     conversation_id,
+                    message_id,
                     role,
                     content,
                     attachments_json,
+                    linked_task_id,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     conversation_id,
+                    message_id,
                     role,
                     content,
                     json.dumps(attachment_payload, ensure_ascii=True),
+                    linked_task_id,
                     now,
                 ),
             )
@@ -231,17 +250,36 @@ class SQLiteStore:
             )
             connection.commit()
         return ConversationMessage(
+            message_id=message_id,
             role=role,
             content=content,
             created_at=now,
             attachments=attachments or [],
+            linked_task_id=linked_task_id,
         )
+
+    def update_conversation_message_task_link(
+        self,
+        *,
+        message_id: str,
+        task_id: str,
+    ) -> None:
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE conversation_messages
+                SET linked_task_id = ?
+                WHERE message_id = ?
+                """,
+                (task_id, message_id),
+            )
+            connection.commit()
 
     def get_conversation_messages(self, conversation_id: str) -> list[ConversationMessage]:
         with self._lock, self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT role, content, created_at, attachments_json
+                SELECT id, role, content, created_at, attachments_json, message_id, linked_task_id
                 FROM conversation_messages
                 WHERE conversation_id = ?
                 ORDER BY id ASC
@@ -250,6 +288,7 @@ class SQLiteStore:
             ).fetchall()
         return [
             ConversationMessage(
+                message_id=row["message_id"] or f"legacy-msg-{row['id']}",
                 role=row["role"],
                 content=row["content"],
                 created_at=row["created_at"],
@@ -258,6 +297,7 @@ class SQLiteStore:
                     for item in json.loads(row["attachments_json"] or "[]")
                     if isinstance(item, dict)
                 ],
+                linked_task_id=row["linked_task_id"],
             )
             for row in rows
         ]
@@ -505,6 +545,8 @@ class SQLiteStore:
             title=row["title"],
             status=row["status"],
             conversation_id=payload.get("conversation_id"),
+            source_message_id=payload.get("source_message_id"),
+            source_message_preview=payload.get("source_message_preview"),
             step_count=len(steps),
             agent_count=len(agent_records) if isinstance(agent_records, list) else 0,
             preferred_language=str(payload.get("preferred_language", "system")),
@@ -521,6 +563,8 @@ class SQLiteStore:
             title=row["title"],
             status=row["status"],
             conversation_id=payload.get("conversation_id"),
+            source_message_id=payload.get("source_message_id"),
+            source_message_preview=payload.get("source_message_preview"),
             preferred_language=str(payload.get("preferred_language", "system")),
             steps=payload.get("steps", []),
             results=payload.get("results", []),
@@ -584,9 +628,11 @@ CREATE TABLE IF NOT EXISTS conversations (
 CREATE TABLE IF NOT EXISTS conversation_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     conversation_id TEXT NOT NULL,
+    message_id TEXT,
     role TEXT NOT NULL,
     content TEXT NOT NULL,
     attachments_json TEXT NOT NULL DEFAULT '[]',
+    linked_task_id TEXT,
     created_at TEXT NOT NULL,
     FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
 );

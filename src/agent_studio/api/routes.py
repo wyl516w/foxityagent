@@ -291,19 +291,26 @@ def build_router(
     async def chat(payload: ChatRequest) -> ChatResponse:
         try:
             conversation_id = payload.conversation_id
+            seed_text = (
+                payload.message
+                or _first_attachment_label(payload.attachments)
+                or "Review the current desktop state and complete the requested goal."
+            )
             latest_image_path = _latest_attachment_path(payload.attachments)
             if latest_image_path:
                 state.update_ui_state(UiStatePayload(latest_capture_path=latest_image_path))
             if conversation_service is not None:
                 summary = conversation_service.ensure_conversation(
                     conversation_id=payload.conversation_id,
-                    seed_message=payload.message or _first_attachment_label(payload.attachments),
+                    seed_message=seed_text,
                 )
                 conversation_id = summary.conversation_id
                 state.update_ui_state(
                     UiStatePayload(current_conversation_id=conversation_id)
                 )
-                conversation_service.append_message(
+            user_message = None
+            if conversation_service is not None and conversation_id is not None:
+                user_message = conversation_service.append_message(
                     conversation_id=conversation_id,
                     role="user",
                     content=payload.message,
@@ -314,9 +321,9 @@ def build_router(
                 task_request = CreateWorkflowTaskRequest(
                     title=None,
                     conversation_id=conversation_id,
-                    instruction=payload.message
-                    or _first_attachment_label(payload.attachments)
-                    or "Review the current desktop state and complete the requested goal.",
+                    instruction=seed_text,
+                    source_message_id=user_message.message_id if user_message is not None else None,
+                    source_message_preview=seed_text,
                     model_assignment=_assignment_from_provider_settings(provider_settings),
                     autonomous=True,
                     max_iterations=8,
@@ -324,6 +331,11 @@ def build_router(
                     steps=[],
                 )
                 task = workflow_service.create_task(task_request)
+                if conversation_service is not None and user_message is not None:
+                    conversation_service.link_message_to_task(
+                        message_id=user_message.message_id,
+                        task_id=task.task_id,
+                    )
                 task = (await workflow_service.run_task(task.task_id)).task
                 response = _build_chat_task_response(
                     payload=payload,
@@ -336,6 +348,7 @@ def build_router(
                         conversation_id=conversation_id,
                         role="assistant",
                         content=response.content,
+                        linked_task_id=task.task_id,
                     )
                 state.append_event(
                     "Chat created autonomous task "
