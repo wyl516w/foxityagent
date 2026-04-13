@@ -5,7 +5,7 @@ from uuid import uuid4
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from agent_studio.api.routes import build_router
+from agent_studio.api.routes import _desktop_folder_seed_steps, build_router
 from agent_studio.core.config import AppConfig
 from agent_studio.core.models import (
     AutomationSettingsPayload,
@@ -520,6 +520,17 @@ def test_chat_route_falls_back_when_autonomous_response_is_low_signal() -> None:
         shutil.rmtree(test_dir, ignore_errors=True)
 
 
+def test_desktop_folder_prompt_uses_seeded_steps_template() -> None:
+    steps = _desktop_folder_seed_steps(
+        "截取桌面的图片，然后分析桌面上可见的有多少个文件夹，然后鼠标移到位于左上角第一个文件夹，然后告诉我这个文件夹叫什么，最后关闭这个文件夹"
+    )
+    assert steps
+    assert steps[0].kind.value == "capture_screen"
+    assert any(step.kind.value == "analyze_image" for step in steps)
+    assert any(step.kind.value == "move_mouse" for step in steps)
+    assert any(step.kind.value == "left_click" for step in steps)
+
+
 def test_delete_conversation_removes_associated_tasks() -> None:
     test_dir = _make_test_dir()
     try:
@@ -717,6 +728,76 @@ def test_workflow_task_routes_create_and_run_tasks() -> None:
         assert list_response.json()["tasks"][0]["task_id"] == task_id
         assert list_response.json()["tasks"][0]["status"] == "completed"
         assert list_response.json()["tasks"][0]["agent_count"] == 3
+    finally:
+        shutil.rmtree(test_dir, ignore_errors=True)
+
+
+def test_move_mouse_without_coordinates_falls_back_to_top_left_default() -> None:
+    test_dir = _make_test_dir()
+    try:
+        config = AppConfig(database_path=test_dir / "agent_studio.db")
+        store = SQLiteStore(
+            database_path=config.database_path,
+            event_retention_limit=config.event_retention_limit,
+        )
+        store.initialize()
+        state = SharedState(config=config, store=store)
+        state.update_automation_settings(
+            AutomationSettingsPayload(control_mode=ControlMode.ALLOW_SESSION)
+        )
+        permission_manager = PermissionManager(state=state)
+        input_controller = NoopInputController(
+            state=state,
+            permission_manager=permission_manager,
+        )
+        perception_service = _StubPerceptionService()
+        workflow_service = WorkflowService(
+            store=store,
+            state=state,
+            perception_service=perception_service,
+            input_controller=input_controller,
+            permission_manager=permission_manager,
+            system_service=SystemService(
+                config=config,
+                perception_service=perception_service,
+            ),
+        )
+
+        app = FastAPI()
+        app.include_router(
+            build_router(
+                config=config,
+                state=state,
+                model_router=ModelRouter(config=config, state=state),
+                permission_manager=permission_manager,
+                input_controller=input_controller,
+                conversation_service=None,
+                perception_service=perception_service,
+                workflow_service=workflow_service,
+                system_service=SystemService(
+                    config=config,
+                    perception_service=perception_service,
+                ),
+            )
+        )
+        client = TestClient(app)
+
+        create_response = client.post(
+            "/api/tasks",
+            json={
+                "title": "Default coordinate fallback",
+                "steps": [{"kind": "move_mouse"}],
+            },
+        )
+        assert create_response.status_code == 200
+        task_id = create_response.json()["task_id"]
+
+        run_response = client.post(f"/api/tasks/{task_id}/run")
+        assert run_response.status_code == 200
+        run_payload = run_response.json()["task"]
+        assert run_payload["status"] == "completed"
+        assert run_payload["results"][0]["kind"] == "move_mouse"
+        assert run_payload["results"][0]["output"]["coordinates"] == "80,80"
     finally:
         shutil.rmtree(test_dir, ignore_errors=True)
 
@@ -926,5 +1007,98 @@ def test_autonomous_task_runs_without_seed_steps_and_can_delegate() -> None:
         assert delegate_result["output"]["model_assignment"]["provider"] == "ollama"
         assert stub_router.settings_history[-1]["provider"] == "ollama"
         assert stub_router.settings_history[-1]["model"] == "qwen3-vl:4b"
+    finally:
+        shutil.rmtree(test_dir, ignore_errors=True)
+
+
+def test_autonomous_task_finishes_when_delegate_instruction_repeats() -> None:
+    test_dir = _make_test_dir()
+    try:
+        config = AppConfig(database_path=test_dir / "agent_studio.db")
+        store = SQLiteStore(
+            database_path=config.database_path,
+            event_retention_limit=config.event_retention_limit,
+        )
+        store.initialize()
+        state = SharedState(config=config, store=store)
+        state.update_automation_settings(
+            AutomationSettingsPayload(control_mode=ControlMode.ALLOW_SESSION)
+        )
+        permission_manager = PermissionManager(state=state)
+        input_controller = NoopInputController(
+            state=state,
+            permission_manager=permission_manager,
+        )
+        perception_service = _StubPerceptionService()
+        stub_router = _StubAutonomousModelRouter(
+            [
+                (
+                    '{"status":"delegate","summary":"Delegate once.",'
+                    '"delegate":{"name":"Verifier","instruction":"Count folders on desktop",'
+                    '"max_iterations":2,"provider":"ollama","model":"qwen3-vl:4b",'
+                    '"base_url":"http://127.0.0.1:11434","assignment_reason":"Vision check"}}'
+                ),
+                (
+                    '{"status":"delegate","summary":"Delegate once.",'
+                    '"delegate":{"name":"Verifier","instruction":"Count folders on desktop",'
+                    '"max_iterations":2,"provider":"ollama","model":"qwen3-vl:4b",'
+                    '"base_url":"http://127.0.0.1:11434","assignment_reason":"Vision check"}}'
+                ),
+                '{"status":"complete","summary":"Child finished."}',
+            ]
+        )
+        workflow_service = WorkflowService(
+            store=store,
+            state=state,
+            perception_service=perception_service,
+            input_controller=input_controller,
+            permission_manager=permission_manager,
+            system_service=SystemService(
+                config=config,
+                perception_service=perception_service,
+            ),
+            model_router=stub_router,
+        )
+
+        app = FastAPI()
+        app.include_router(
+            build_router(
+                config=config,
+                state=state,
+                model_router=ModelRouter(config=config, state=state),
+                permission_manager=permission_manager,
+                input_controller=input_controller,
+                conversation_service=None,
+                perception_service=perception_service,
+                workflow_service=workflow_service,
+                system_service=SystemService(
+                    config=config,
+                    perception_service=perception_service,
+                ),
+            )
+        )
+        client = TestClient(app)
+
+        create_response = client.post(
+            "/api/tasks",
+            json={
+                "instruction": "Check folders and report.",
+                "steps": [],
+                "autonomous": True,
+                "max_iterations": 6,
+            },
+        )
+        assert create_response.status_code == 200
+        task_id = create_response.json()["task_id"]
+
+        run_response = client.post(f"/api/tasks/{task_id}/run")
+        assert run_response.status_code == 200
+        task_payload = run_response.json()["task"]
+        assert task_payload["status"] == "completed"
+        assert any(result["kind"] == "delegate_agent" for result in task_payload["results"])
+        assert any(result["kind"] == "complete" for result in task_payload["results"])
+        assert (
+            "Repeated delegation request detected" not in task_payload["last_message"]
+        )
     finally:
         shutil.rmtree(test_dir, ignore_errors=True)

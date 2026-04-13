@@ -563,6 +563,8 @@ class WorkflowService:
         payload["execution_context"] = self._context_to_payload(context)
         if final_status != TaskStatus.WAITING_APPROVAL:
             payload["pending_approval"] = None
+            if flat_results:
+                payload["last_message"] = flat_results[-1].message
         if not payload.get("last_message"):
             payload["last_message"] = (
                 flat_results[-1].message if flat_results else "Task finished without actions."
@@ -678,6 +680,41 @@ class WorkflowService:
             if plan.status == "delegate":
                 child_name = (plan.delegate_name or "Subagent").strip()
                 child_instruction = (plan.delegate_instruction or "").strip()
+                normalized_child_instruction = child_instruction.lower()
+                delegated_instructions = {
+                    str((item.get("output") or {}).get("child_instruction") or "")
+                    .strip()
+                    .lower()
+                    for item in agent.get("results", [])
+                    if str(item.get("kind", "")) == WorkflowStepType.DELEGATE_AGENT.value
+                }
+                if (
+                    normalized_child_instruction
+                    and normalized_child_instruction in delegated_instructions
+                ):
+                    agent["autonomous_complete"] = True
+                    completion_step = WorkflowStepDefinition(
+                        kind=WorkflowStepType.COMPLETE,
+                        label="Complete",
+                    )
+                    agent.setdefault("steps", []).append(
+                        completion_step.model_dump(mode="json")
+                    )
+                    completion_result = WorkflowStepResult(
+                        index=len(agent.get("steps", [])),
+                        kind=WorkflowStepType.COMPLETE,
+                        agent_id=str(agent["agent_id"]),
+                        agent_name=str(agent["name"]),
+                        label=completion_step.label,
+                        ok=True,
+                        message=(
+                            plan.summary
+                            or "Repeated delegation request detected; finishing with current findings."
+                        ),
+                    )
+                    agent["results"].append(completion_result.model_dump(mode="json"))
+                    flat_results.append(completion_result)
+                    break
                 child_agent = self._make_agent_record(
                     name=child_name,
                     parent_agent_id=str(agent["agent_id"]),
@@ -1291,7 +1328,11 @@ class WorkflowService:
         context: WorkflowExecutionContext,
     ) -> ControlActionPayload:
         if step.kind == WorkflowStepType.MOVE_MOUSE:
-            coordinates = step.text or context.last_match_coordinates
+            coordinates = (
+                (step.text or "").strip()
+                or (context.last_match_coordinates or "").strip()
+                or "80,80"
+            )
             return ControlActionPayload(
                 action=ControlActionType.MOVE_MOUSE,
                 text=coordinates,

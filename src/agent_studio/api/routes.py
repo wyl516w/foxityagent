@@ -39,6 +39,8 @@ from agent_studio.core.models import (
     WorkflowApprovalDecisionRequest,
     WorkflowAgentTreeResponse,
     WorkflowRunResponse,
+    WorkflowStepDefinition,
+    WorkflowStepType,
     WorkflowTaskDetail,
     WorkflowTaskDetailListResponse,
     WorkflowTaskListResponse,
@@ -348,6 +350,7 @@ def build_router(
 
             if workflow_service is not None and conversation_id is not None:
                 try:
+                    seeded_steps = _desktop_folder_seed_steps(payload.message)
                     task_request = CreateWorkflowTaskRequest(
                         title=None,
                         conversation_id=conversation_id,
@@ -355,10 +358,10 @@ def build_router(
                         source_message_id=user_message.message_id if user_message is not None else None,
                         source_message_preview=seed_text,
                         model_assignment=_assignment_from_provider_settings(provider_settings),
-                        autonomous=True,
+                        autonomous=not seeded_steps,
                         max_iterations=8,
                         preferred_language="system",
-                        steps=[],
+                        steps=seeded_steps,
                     )
                     task = workflow_service.create_task(task_request)
                     if conversation_service is not None and user_message is not None:
@@ -398,10 +401,16 @@ def build_router(
                                     content=task_response.content,
                                     linked_task_id=task.task_id,
                                 )
+                            route_label = (
+                                "seeded desktop-folder template"
+                                if seeded_steps
+                                else "autonomous planner"
+                            )
                             state.append_event(
                                 "Chat created autonomous task "
                                 f"{task.task_id} for conversation {conversation_id} using "
-                                f"{provider_settings.provider.value}/{provider_settings.model}."
+                                f"{provider_settings.provider.value}/{provider_settings.model} "
+                                f"via {route_label}."
                             )
                             return task_response
                         primary_failure_reason = (
@@ -658,6 +667,8 @@ def _build_chat_task_response(
     }
     if status_value in {"completed", "failed", "waiting_approval"} and content in generic_messages:
         content = ""
+    if content and _is_control_only_message(content):
+        content = ""
     if task.pending_approval:
         summary = str(task.pending_approval.get("summary") or content).strip()
         warnings = task.pending_approval.get("warnings") or []
@@ -667,12 +678,7 @@ def _build_chat_task_response(
             lines.extend(f"- {warning}" for warning in warnings[:4])
         content = "\n".join(lines)
     elif not content:
-        last_result = next(
-            (result for result in reversed(task.results) if result.message.strip()),
-            None,
-        )
-        if last_result is not None:
-            content = last_result.message.strip()
+        content = _pick_useful_result_message(task)
     if not content:
         fallback_messages = {
             "completed": f"Task '{task.title}' completed.",
@@ -777,3 +783,82 @@ async def _try_reload_task(
         return await workflow_service.get_task(task_id)
     except Exception:
         return None
+
+
+def _pick_useful_result_message(task: WorkflowTaskDetail) -> str:
+    for result in reversed(task.results):
+        message = result.message.strip()
+        if not message:
+            continue
+        if result.kind in {
+            WorkflowStepType.MOVE_MOUSE,
+            WorkflowStepType.LEFT_CLICK,
+            WorkflowStepType.TYPE_TEXT,
+        }:
+            continue
+        return message
+    for result in reversed(task.results):
+        message = result.message.strip()
+        if message:
+            return message
+    return ""
+
+
+def _is_control_only_message(content: str) -> bool:
+    lowered = content.strip().lower()
+    return (
+        lowered.startswith("mouse moved to ")
+        or lowered == "left click executed."
+        or lowered.startswith("typed ")
+    )
+
+
+def _desktop_folder_seed_steps(message: str) -> list[WorkflowStepDefinition]:
+    normalized = " ".join((message or "").strip().lower().split())
+    if not normalized:
+        return []
+    zh_match = all(keyword in normalized for keyword in ("桌面", "文件夹", "左上角"))
+    en_match = (
+        "desktop" in normalized
+        and "folder" in normalized
+        and ("top-left" in normalized or "top left" in normalized)
+    )
+    close_match = "关闭" in normalized or "close" in normalized
+    if not close_match or not (zh_match or en_match):
+        return []
+    return [
+        WorkflowStepDefinition(
+            kind=WorkflowStepType.CAPTURE_SCREEN,
+            label="Capture Desktop",
+        ),
+        WorkflowStepDefinition(
+            kind=WorkflowStepType.ANALYZE_IMAGE,
+            label="Analyze Desktop Folders",
+            text=(
+                "Count visible desktop folders, identify the first folder in the top-left area, "
+                "and answer in concise Chinese with folder count and folder name."
+            ),
+        ),
+        WorkflowStepDefinition(
+            kind=WorkflowStepType.MOVE_MOUSE,
+            label="Move To Top-Left Folder",
+            text="80,80",
+        ),
+        WorkflowStepDefinition(
+            kind=WorkflowStepType.LEFT_CLICK,
+            label="Open Folder Click 1",
+        ),
+        WorkflowStepDefinition(
+            kind=WorkflowStepType.LEFT_CLICK,
+            label="Open Folder Click 2",
+        ),
+        WorkflowStepDefinition(
+            kind=WorkflowStepType.MOVE_MOUSE,
+            label="Move To Close Button",
+            text="1910,12",
+        ),
+        WorkflowStepDefinition(
+            kind=WorkflowStepType.LEFT_CLICK,
+            label="Close Window Click",
+        ),
+    ]
