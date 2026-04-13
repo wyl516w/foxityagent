@@ -2,6 +2,11 @@
 
 ## 2026-04-13
 
+- Entered phase G / step 1 and rewrote `实现计划.md` to formally shift the project from a workflow-first prototype toward a conversation-driven desktop agent workbench.
+- Added two explicit planning tracks to `实现计划.md`: one for immediate code-governance cleanup (`main_window.py` duplicates, API/UI contract mismatches, backend fail-fast, audit persistence, query efficiency, test drift) and one for the product-level transition to a conversation-centered agent loop.
+- Replaced `用户手册.md` with a clean current-state manual that reflects the new product direction without claiming the conversation-first UI refactor is already complete.
+- This round is documentation-only; the next implementation step is phase G / step 2: simplify the main window and remove workflow-first UI residue.
+
 - Entered phase F / step 7 and wired the chat composer into a one-click local autonomous-task launcher so a single goal can create and immediately run a task without manually switching to the task builder first.
 - Updated `src/agent_studio/ui/main_window.py` so the prompt area now offers both normal chat sending and `Start Local Agent Task`, with the local-task path automatically creating a root agent bound to `Ollama / qwen3-vl:4b`, seeding attached images as `analyze_image` steps, opening the task tab, and starting execution right away.
 - Updated `src/agent_studio/services/workflows/workflow_service.py` so image-based workflow steps keep their image path in the active execution context, allowing chat-seeded visual tasks to continue planning against the same image after the first analysis step.
