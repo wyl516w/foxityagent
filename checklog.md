@@ -2,6 +2,12 @@
 
 ## 2026-04-13
 
+- Completed phase G / step 5 by wiring explicit message-to-run mapping in `src/agent_studio/ui/main_window.py` with internal links (`task://{task_id}`, `message://{message_id}`), bidirectional jump behavior, and visible left-side message highlighting based on `linked_task_id` and `source_message_id`.
+- Hardened `/api/chat` in `src/agent_studio/api/routes.py` so autonomous execution remains the primary path but no longer a single point of failure: task-create/task-run errors and low-signal autonomous outputs now trigger direct `model_router.chat(...)` fallback while preserving conversation history and task linkage metadata.
+- Added regression coverage in `tests/test_workflow_routes.py` for autonomous failure fallback, low-signal fallback, task metadata retention, conversation message linkage, and `source_message_id` consistency in `/api/conversations/{id}/tasks/details`.
+- Added mapping helper tests in `tests/test_internal_links.py` for internal protocol parsing/building used by the G / 5 UI navigation flow.
+- Verified this round with `python -m py_compile`, `.venv\\Scripts\\python.exe -m pytest -q` (`35 passed`), and `.venv\\Scripts\\python.exe -m ruff check src tests`.
+
 - Entered phase G / step 4 and refined the right-hand workspace in `src/agent_studio/ui/main_window.py` so it reads more like a conversation execution view than a workflow console.
 - Updated the right-side run tabs to be status-first, removed the raw task ID from the visible summary, and re-labeled the run and agent sections around active agents, recent actions, child agents, and approval state instead of workflow-first wording.
 - Replaced the corrupted translation table in `src/agent_studio/ui/i18n.py` with a clean UTF-8 language map for English and Simplified Chinese, including the updated conversation-first wording for the main shell and settings dialog.

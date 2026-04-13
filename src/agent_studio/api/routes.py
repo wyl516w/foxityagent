@@ -316,49 +316,98 @@ def build_router(
                     content=payload.message,
                     attachments=_attachments_for_storage(payload.attachments),
                 )
-            if workflow_service is not None and conversation_id is not None:
-                provider_settings = state.get_provider_settings()
-                task_request = CreateWorkflowTaskRequest(
-                    title=None,
-                    conversation_id=conversation_id,
-                    instruction=seed_text,
-                    source_message_id=user_message.message_id if user_message is not None else None,
-                    source_message_preview=seed_text,
-                    model_assignment=_assignment_from_provider_settings(provider_settings),
-                    autonomous=True,
-                    max_iterations=8,
-                    preferred_language="system",
-                    steps=[],
-                )
-                task = workflow_service.create_task(task_request)
-                if conversation_service is not None and user_message is not None:
-                    conversation_service.link_message_to_task(
-                        message_id=user_message.message_id,
-                        task_id=task.task_id,
-                    )
-                task = (await workflow_service.run_task(task.task_id)).task
-                response = _build_chat_task_response(
-                    payload=payload,
-                    conversation_id=conversation_id,
-                    task=task,
-                    config=config,
-                )
-                if conversation_service is not None:
-                    conversation_service.append_message(
-                        conversation_id=conversation_id,
-                        role="assistant",
-                        content=response.content,
-                        linked_task_id=task.task_id,
-                    )
-                state.append_event(
-                    "Chat created autonomous task "
-                    f"{task.task_id} for conversation {conversation_id} using "
-                    f"{provider_settings.provider.value}/{provider_settings.model}."
-                )
-                return response
+            task: WorkflowTaskDetail | None = None
+            primary_failure_reason: str | None = None
+            provider_settings = state.get_provider_settings()
 
-            response = await model_router.chat(
-                payload.model_copy(update={"conversation_id": conversation_id})
+            if workflow_service is not None and conversation_id is not None:
+                try:
+                    task_request = CreateWorkflowTaskRequest(
+                        title=None,
+                        conversation_id=conversation_id,
+                        instruction=seed_text,
+                        source_message_id=user_message.message_id if user_message is not None else None,
+                        source_message_preview=seed_text,
+                        model_assignment=_assignment_from_provider_settings(provider_settings),
+                        autonomous=True,
+                        max_iterations=8,
+                        preferred_language="system",
+                        steps=[],
+                    )
+                    task = workflow_service.create_task(task_request)
+                    if conversation_service is not None and user_message is not None:
+                        conversation_service.link_message_to_task(
+                            message_id=user_message.message_id,
+                            task_id=task.task_id,
+                        )
+                except Exception as exc:
+                    primary_failure_reason = f"autonomous task creation failed: {exc}"
+                else:
+                    try:
+                        task = (await workflow_service.run_task(task.task_id)).task
+                    except Exception as exc:
+                        primary_failure_reason = f"autonomous task execution failed: {exc}"
+                        refreshed_task = await _try_reload_task(
+                            workflow_service=workflow_service,
+                            task_id=task.task_id,
+                        )
+                        if refreshed_task is not None:
+                            task = refreshed_task
+                    else:
+                        task_response = _build_chat_task_response(
+                            payload=payload,
+                            conversation_id=conversation_id,
+                            task=task,
+                            config=config,
+                        )
+                        should_fallback, fallback_reason = _should_fallback_to_direct_chat(
+                            task=task,
+                            content=task_response.content,
+                        )
+                        if not should_fallback:
+                            if conversation_service is not None:
+                                conversation_service.append_message(
+                                    conversation_id=conversation_id,
+                                    role="assistant",
+                                    content=task_response.content,
+                                    linked_task_id=task.task_id,
+                                )
+                            state.append_event(
+                                "Chat created autonomous task "
+                                f"{task.task_id} for conversation {conversation_id} using "
+                                f"{provider_settings.provider.value}/{provider_settings.model}."
+                            )
+                            return task_response
+                        primary_failure_reason = (
+                            fallback_reason
+                            or "autonomous task returned a low-signal response."
+                        )
+
+            if primary_failure_reason is not None:
+                state.append_event(
+                    f"Chat autonomous route fallback reason: {primary_failure_reason}"
+                )
+                state.append_event("Chat switched to direct model fallback response.")
+
+            try:
+                response = await model_router.chat(
+                    payload.model_copy(update={"conversation_id": conversation_id})
+                )
+            except Exception as exc:
+                if primary_failure_reason is not None:
+                    detail = (
+                        "Chat primary failure: "
+                        f"{primary_failure_reason}; fallback failure: {exc}"
+                    )
+                else:
+                    detail = f"Direct chat failed: {exc}"
+                state.append_event(f"Chat request failed: {detail}")
+                raise HTTPException(status_code=502, detail=detail) from exc
+
+            response = _merge_chat_response_with_task(
+                response=response,
+                conversation_id=conversation_id,
+                task=task,
             )
 
             if conversation_service is not None and conversation_id is not None:
@@ -366,9 +415,7 @@ def build_router(
                     conversation_id=conversation_id,
                     role="assistant",
                     content=response.content,
-                )
-                response = response.model_copy(
-                    update={"conversation_id": conversation_id}
+                    linked_task_id=task.task_id if task is not None else None,
                 )
             if response.fallback_used:
                 attempted = " -> ".join(
@@ -383,6 +430,8 @@ def build_router(
                     f" with {response.attachment_count} image attachment(s)."
                 )
             return response
+        except HTTPException:
+            raise
         except Exception as exc:  # pragma: no cover - surfaced to UI
             state.append_event(f"Chat request failed: {exc}")
             raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -633,3 +682,72 @@ def _assignment_from_provider_settings(
             "stays aligned with the active model configuration."
         ),
     )
+
+
+def _should_fallback_to_direct_chat(
+    *,
+    task: WorkflowTaskDetail,
+    content: str,
+) -> tuple[bool, str | None]:
+    status_value = task.status.value
+    if status_value == "failed":
+        return True, "autonomous task ended with status failed"
+
+    normalized_content = content.strip()
+    if not normalized_content:
+        return True, "autonomous task returned empty content"
+
+    if _is_task_status_placeholder(normalized_content):
+        return True, "autonomous task returned a placeholder status message"
+
+    lowered_content = normalized_content.lower()
+    low_signal_markers = (
+        "autonomous planning failed",
+        "planner did not return valid json",
+        "autonomous planning reached the maximum number of iterations",
+        "task is running.",
+        "task created and ready to run.",
+    )
+    for marker in low_signal_markers:
+        if marker in lowered_content:
+            return True, f"autonomous task returned low-signal content: {marker}"
+    return False, None
+
+
+def _is_task_status_placeholder(content: str) -> bool:
+    lowered = content.strip().lower()
+    return lowered.startswith("task '") and (
+        lowered.endswith("' completed.")
+        or lowered.endswith("' failed.")
+        or lowered.endswith("' is waiting for approval.")
+        or lowered.endswith("' is running.")
+    )
+
+
+def _merge_chat_response_with_task(
+    *,
+    response: ChatResponse,
+    conversation_id: str | None,
+    task: WorkflowTaskDetail | None,
+) -> ChatResponse:
+    updates: dict[str, str | None] = {"conversation_id": conversation_id}
+    if task is not None:
+        updates.update(
+            {
+                "task_id": task.task_id,
+                "task_status": task.status.value,
+                "task_title": task.title,
+            }
+        )
+    return response.model_copy(update=updates)
+
+
+async def _try_reload_task(
+    *,
+    workflow_service: WorkflowService,
+    task_id: str,
+) -> WorkflowTaskDetail | None:
+    try:
+        return await workflow_service.get_task(task_id)
+    except Exception:
+        return None

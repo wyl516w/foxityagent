@@ -13,6 +13,13 @@ from agent_studio.core.config import AppConfig
 from agent_studio.core.models import ApprovalTimeoutAction, ControlMode, OutputMode
 from agent_studio.core.state import SharedState
 from agent_studio.services.backend_server import BackendServer
+from agent_studio.ui.internal_links import (
+    MESSAGE_LINK_SCHEME,
+    TASK_LINK_SCHEME,
+    build_internal_link,
+    message_anchor_name,
+    parse_internal_link,
+)
 from agent_studio.ui.i18n import SYSTEM_LANGUAGE, translate
 from agent_studio.ui.settings_dialog import SettingsDialog
 
@@ -97,6 +104,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._task_payloads: dict[str, dict] = {}
         self._selected_chat_attachments: list[str] = []
         self._loaded_conversation_payload: dict | None = None
+        self._highlighted_message_id: str | None = None
+        self._pending_task_link_id: str | None = None
         self._last_settings_payload = self._snapshot_from_state()
         self._active_settings_dialog: SettingsDialog | None = None
         self._pending_approval: dict | None = None
@@ -248,7 +257,7 @@ class MainWindow(QtWidgets.QMainWindow):
         chat_layout.setSpacing(12)
 
         self.chat_view = QtWidgets.QTextBrowser()
-        self.chat_view.setOpenExternalLinks(True)
+        self.chat_view.setOpenExternalLinks(False)
         chat_layout.addWidget(self.chat_view, stretch=1)
 
         self.prompt_group = QtWidgets.QGroupBox()
@@ -330,6 +339,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return self.activity_group
 
     def _wire_signals(self) -> None:
+        self.chat_view.anchorClicked.connect(self._on_browser_link_clicked)
         self.settings_button.clicked.connect(self.open_settings_dialog)
         self.refresh_button.clicked.connect(self.refresh_all)
         self.new_conversation_button.clicked.connect(self.create_conversation)
@@ -597,6 +607,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.current_conversation_id = None
             self.loaded_conversation_id = None
             self._loaded_conversation_payload = None
+            self._highlighted_message_id = None
+            self._pending_task_link_id = None
             self._render_empty_chat()
             self._rebuild_task_tabs([], None)
             self._update_conversation_banner()
@@ -636,7 +648,14 @@ class MainWindow(QtWidgets.QMainWindow):
         ordered_tasks = [task for task in tasks if isinstance(task, dict) and task.get("task_id")]
         self._task_payloads = {str(task["task_id"]): task for task in ordered_tasks}
         target_id = self.selected_task_id if self.selected_task_id in self._task_payloads else None
-        if target_id is None and ordered_tasks:
+        if self._pending_task_link_id:
+            pending = self._pending_task_link_id
+            self._pending_task_link_id = None
+            if pending in self._task_payloads:
+                target_id = pending
+            else:
+                self.statusBar().showMessage(f"未找到对应执行 {pending}", 3500)
+        if target_id is None and ordered_tasks and self.selected_task_id is None:
             target_id = str(ordered_tasks[0].get("task_id"))
         self._rebuild_task_tabs(ordered_tasks, target_id)
 
@@ -679,7 +698,8 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.setSpacing(10)
 
         summary_view = QtWidgets.QTextBrowser()
-        summary_view.setOpenExternalLinks(True)
+        summary_view.setOpenExternalLinks(False)
+        summary_view.anchorClicked.connect(self._on_browser_link_clicked)
         summary_view.setMinimumHeight(220)
         layout.addWidget(summary_view)
 
@@ -716,6 +736,7 @@ class MainWindow(QtWidgets.QMainWindow):
         title = escape(str(task.get("title", self._t("activity"))).strip() or self._t("activity"))
         status = escape(self._task_status_label(str(task.get("status", "draft"))))
         last_message = escape(str(task.get("last_message") or self._t("label_none")))
+        source_mapping_html = self._render_task_source_mapping(task)
         agents = task.get("agents", [])
         results = task.get("results", [])
         html: list[str] = [
@@ -724,6 +745,7 @@ class MainWindow(QtWidgets.QMainWindow):
             f"<tr><td><b>{escape(self._t('task_status'))}</b></td><td>{status}</td></tr>",
             f"<tr><td><b>{escape(self._t('task_agents'))}</b></td><td>{len(agents)}</td></tr>",
             f"<tr><td><b>{escape(self._t('task_last_message'))}</b></td><td>{last_message}</td></tr>",
+            f"<tr><td><b>触发消息</b></td><td>{source_mapping_html}</td></tr>",
             "</table>",
         ]
 
@@ -814,19 +836,64 @@ class MainWindow(QtWidgets.QMainWindow):
             role_label = self._t("chat_role_user" if role == "user" else "chat_role_assistant")
             timestamp = self._compact_timestamp(message.get("created_at"))
             content = escape(str(message.get("content", ""))).replace("\n", "<br>")
+            message_id = str(message.get("message_id") or "").strip()
+            linked_task_id = str(message.get("linked_task_id") or "").strip()
+            is_highlighted = bool(
+                message_id and message_id == (self._highlighted_message_id or "")
+            )
+            border_color = "#2563eb" if is_highlighted else "#d8deea"
+            background = "#eff6ff" if is_highlighted else "#ffffff"
             attachments = self._render_message_attachments(message.get("attachments", []))
+            mapping = self._render_message_task_mapping(
+                message_id=message_id,
+                linked_task_id=linked_task_id,
+            )
+            anchor_html = (
+                f"<a id='{escape(message_anchor_name(message_id))}'></a>" if message_id else ""
+            )
             blocks.append(
                 (
-                    "<div style='margin-bottom:16px;padding:14px;border:1px solid #d8deea;"
-                    "border-radius:12px;background:#ffffff;'>"
+                    "<div style='margin-bottom:16px;padding:14px;"
+                    f"border:1px solid {border_color};border-radius:12px;background:{background};'>"
+                    f"{anchor_html}"
                     f"<div style='font-weight:700;margin-bottom:6px;'>{escape(role_label)}</div>"
                     f"<div style='color:#60708a;margin-bottom:8px;'>{escape(timestamp)}</div>"
-                    f"<div>{content or '&nbsp;'}</div>{attachments}</div>"
+                    f"<div>{content or '&nbsp;'}</div>{mapping}{attachments}</div>"
                 )
             )
         if not messages:
             blocks.append(f"<p>{escape(self._t('conversation_empty'))}</p>")
         self.chat_view.setHtml(self._wrap_html_body("".join(blocks)))
+        if self._highlighted_message_id:
+            self.chat_view.scrollToAnchor(message_anchor_name(self._highlighted_message_id))
+
+    def _render_message_task_mapping(self, *, message_id: str, linked_task_id: str) -> str:
+        if linked_task_id:
+            task_link = build_internal_link(TASK_LINK_SCHEME, linked_task_id)
+            return (
+                "<div style='margin-top:10px;color:#1e3a8a;'>"
+                f"<b>对应执行</b>: <a href='{escape(task_link)}'>{escape(linked_task_id)}</a>"
+                "</div>"
+            )
+        if not message_id:
+            return ""
+        return "<div style='margin-top:10px;color:#60708a;'><b>对应执行</b>: 无映射</div>"
+
+    def _render_task_source_mapping(self, task: dict) -> str:
+        source_message_id = str(task.get("source_message_id") or "").strip()
+        if not source_message_id:
+            return "无映射"
+        message_link = build_internal_link(MESSAGE_LINK_SCHEME, source_message_id)
+        preview = str(task.get("source_message_preview") or "").strip()
+        preview_html = (
+            f"<div style='color:#60708a;margin-top:4px;'>{escape(preview[:72])}</div>"
+            if preview
+            else ""
+        )
+        return (
+            f"<a href='{escape(message_link)}'>{escape(source_message_id)}</a>"
+            f"{preview_html}"
+        )
 
     def _render_message_attachments(self, attachments: list[dict]) -> str:
         if not attachments:
@@ -1025,6 +1092,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.current_conversation_id = conversation_id
         self.selected_task_id = None
+        self._highlighted_message_id = None
+        self._pending_task_link_id = None
         self._queue_request(
             "ui:conversation",
             "/api/settings/ui",
@@ -1049,11 +1118,63 @@ class MainWindow(QtWidgets.QMainWindow):
         task_id = widget.property("task_id") if widget is not None else None
         if not isinstance(task_id, str) or not task_id:
             self.selected_task_id = None
+            self._set_highlighted_message(None)
             self._set_pending_approval(None)
             return
         self.selected_task_id = task_id
         task = self._task_payloads.get(task_id)
+        source_message_id = (
+            str(task.get("source_message_id") or "").strip() if isinstance(task, dict) else ""
+        )
+        self._set_highlighted_message(source_message_id or None)
         self._set_pending_approval(task.get("pending_approval") if task else None)
+
+    def _on_browser_link_clicked(self, url: QtCore.QUrl) -> None:
+        parsed = parse_internal_link(url.toString())
+        if parsed is None:
+            QtGui.QDesktopServices.openUrl(url)
+            return
+        scheme, identifier = parsed
+        if scheme == TASK_LINK_SCHEME:
+            self._focus_task_from_link(identifier)
+            return
+        if scheme == MESSAGE_LINK_SCHEME:
+            self._focus_message_from_link(identifier)
+            return
+        QtGui.QDesktopServices.openUrl(url)
+
+    def _focus_task_from_link(self, task_id: str) -> None:
+        normalized = task_id.strip()
+        if not normalized:
+            return
+        for index in range(self.task_tabs.count()):
+            widget = self.task_tabs.widget(index)
+            widget_task_id = widget.property("task_id") if widget is not None else None
+            if widget_task_id == normalized:
+                self.task_tabs.setCurrentIndex(index)
+                self.statusBar().showMessage(f"已定位到对应执行 {normalized}", 3000)
+                return
+        self._pending_task_link_id = normalized
+        if self.current_conversation_id:
+            self.load_conversation_tasks(self.current_conversation_id)
+        self.statusBar().showMessage(f"正在加载执行 {normalized}", 3000)
+
+    def _focus_message_from_link(self, message_id: str) -> None:
+        normalized = message_id.strip()
+        if not normalized:
+            return
+        self._set_highlighted_message(normalized)
+        self.statusBar().showMessage(f"已定位到触发消息 {normalized}", 3000)
+
+    def _set_highlighted_message(self, message_id: str | None) -> None:
+        normalized = (message_id or "").strip() or None
+        if normalized == self._highlighted_message_id and self._loaded_conversation_payload is not None:
+            if normalized:
+                self.chat_view.scrollToAnchor(message_anchor_name(normalized))
+            return
+        self._highlighted_message_id = normalized
+        if self._loaded_conversation_payload is not None:
+            self._render_chat_history(self._loaded_conversation_payload)
 
     def _set_pending_approval(self, pending: dict | None) -> None:
         previous_id = (

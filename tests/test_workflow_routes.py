@@ -20,6 +20,8 @@ from agent_studio.core.models import (
     ProviderSettingsPayload,
     ProviderType,
     ScreenshotResponse,
+    TaskStatus,
+    WorkflowRunResponse,
 )
 from agent_studio.core.state import SharedState
 from agent_studio.services.automation.noop_controller import NoopInputController
@@ -320,6 +322,200 @@ def test_chat_route_creates_autonomous_task_when_workflow_service_is_enabled() -
         assert model_router.settings_history[0]["provider"] == "openai_compatible"
         assert model_router.settings_history[0]["model"] == "gpt-4.1-mini"
         assert model_router.settings_history[0]["base_url"] == "https://api.example.test/v1"
+    finally:
+        shutil.rmtree(test_dir, ignore_errors=True)
+
+
+def test_chat_route_falls_back_to_direct_chat_when_autonomous_execution_fails() -> None:
+    test_dir = _make_test_dir()
+    try:
+        config = AppConfig(database_path=test_dir / "agent_studio.db")
+        store = SQLiteStore(
+            database_path=config.database_path,
+            event_retention_limit=config.event_retention_limit,
+        )
+        store.initialize()
+        state = SharedState(config=config, store=store)
+        permission_manager = PermissionManager(state=state)
+        input_controller = NoopInputController(
+            state=state,
+            permission_manager=permission_manager,
+        )
+        perception_service = _StubPerceptionService()
+        model_router = _StubAutonomousModelRouter(
+            responses=["Direct fallback answer from chat route."]
+        )
+        workflow_service = WorkflowService(
+            store=store,
+            state=state,
+            perception_service=perception_service,
+            input_controller=input_controller,
+            permission_manager=permission_manager,
+            system_service=SystemService(
+                config=config,
+                perception_service=perception_service,
+                state=state,
+                model_router=model_router,
+            ),
+            model_router=model_router,
+        )
+
+        async def _failing_run_task(task_id: str) -> WorkflowRunResponse:
+            raise RuntimeError(
+                "Planner did not return valid JSON for autonomous execution."
+            )
+
+        workflow_service.run_task = _failing_run_task  # type: ignore[method-assign]
+
+        app = FastAPI()
+        app.include_router(
+            build_router(
+                config=config,
+                state=state,
+                model_router=model_router,
+                permission_manager=permission_manager,
+                input_controller=input_controller,
+                conversation_service=ConversationService(store=store),
+                perception_service=perception_service,
+                workflow_service=workflow_service,
+                system_service=SystemService(
+                    config=config,
+                    perception_service=perception_service,
+                    state=state,
+                    model_router=model_router,
+                ),
+            )
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/api/chat",
+            json={"message": "Check planner fallback reliability."},
+        )
+        assert response.status_code == 200
+        payload = response.json()
+
+        assert payload["content"] == "Direct fallback answer from chat route."
+        assert payload["task_id"]
+        assert payload["task_status"] == TaskStatus.DRAFT.value
+        assert payload["task_title"]
+
+        settings_payload = client.get("/api/settings").json()
+        events = settings_payload["recent_events"]
+        assert any("fallback reason" in item for item in events)
+        assert any("switched to direct model fallback" in item for item in events)
+
+        history = client.get(f"/api/conversations/{payload['conversation_id']}")
+        assert history.status_code == 200
+        messages = history.json()["messages"]
+        assert len(messages) == 2
+        user_message = messages[0]
+        assistant_message = messages[1]
+        assert user_message["role"] == "user"
+        assert user_message["message_id"]
+        assert user_message["linked_task_id"] == payload["task_id"]
+        assert assistant_message["role"] == "assistant"
+        assert assistant_message["linked_task_id"] == payload["task_id"]
+        assert assistant_message["content"] == "Direct fallback answer from chat route."
+
+        task_details = client.get(
+            f"/api/conversations/{payload['conversation_id']}/tasks/details"
+        )
+        assert task_details.status_code == 200
+        detail_payload = task_details.json()
+        assert detail_payload["tasks"][0]["task_id"] == payload["task_id"]
+        assert detail_payload["tasks"][0]["source_message_id"] == user_message["message_id"]
+    finally:
+        shutil.rmtree(test_dir, ignore_errors=True)
+
+
+def test_chat_route_falls_back_when_autonomous_response_is_low_signal() -> None:
+    test_dir = _make_test_dir()
+    try:
+        config = AppConfig(database_path=test_dir / "agent_studio.db")
+        store = SQLiteStore(
+            database_path=config.database_path,
+            event_retention_limit=config.event_retention_limit,
+        )
+        store.initialize()
+        state = SharedState(config=config, store=store)
+        permission_manager = PermissionManager(state=state)
+        input_controller = NoopInputController(
+            state=state,
+            permission_manager=permission_manager,
+        )
+        perception_service = _StubPerceptionService()
+        model_router = _StubAutonomousModelRouter(
+            responses=["Direct fallback content after low-signal run."]
+        )
+        workflow_service = WorkflowService(
+            store=store,
+            state=state,
+            perception_service=perception_service,
+            input_controller=input_controller,
+            permission_manager=permission_manager,
+            system_service=SystemService(
+                config=config,
+                perception_service=perception_service,
+                state=state,
+                model_router=model_router,
+            ),
+            model_router=model_router,
+        )
+
+        async def _low_signal_run_task(task_id: str) -> WorkflowRunResponse:
+            created = store.get_task(task_id)
+            assert created is not None
+            payload = store.get_task_payload(task_id) or {}
+            payload["last_message"] = "Task is running."
+            updated = store.update_task(
+                task_id,
+                status=TaskStatus.COMPLETED.value,
+                payload=payload,
+                title=created.title,
+            )
+            return WorkflowRunResponse(task=updated)
+
+        workflow_service.run_task = _low_signal_run_task  # type: ignore[method-assign]
+
+        app = FastAPI()
+        app.include_router(
+            build_router(
+                config=config,
+                state=state,
+                model_router=model_router,
+                permission_manager=permission_manager,
+                input_controller=input_controller,
+                conversation_service=ConversationService(store=store),
+                perception_service=perception_service,
+                workflow_service=workflow_service,
+                system_service=SystemService(
+                    config=config,
+                    perception_service=perception_service,
+                    state=state,
+                    model_router=model_router,
+                ),
+            )
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/api/chat",
+            json={"message": "Run with low-signal autonomous output."},
+        )
+        assert response.status_code == 200
+        payload = response.json()
+
+        assert payload["content"] == "Direct fallback content after low-signal run."
+        assert payload["task_id"]
+        assert payload["task_status"] == TaskStatus.COMPLETED.value
+        assert payload["task_title"]
+        assert payload["content"] != "Task is running."
+
+        settings_payload = client.get("/api/settings").json()
+        events = settings_payload["recent_events"]
+        assert any("low-signal" in item or "placeholder" in item for item in events)
+        assert any("switched to direct model fallback" in item for item in events)
     finally:
         shutil.rmtree(test_dir, ignore_errors=True)
 
