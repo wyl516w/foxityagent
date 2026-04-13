@@ -1,0 +1,541 @@
+from __future__ import annotations
+
+from fastapi import APIRouter, HTTPException
+
+from agent_studio.core.config import AppConfig
+from agent_studio.core.models import (
+    AgentModelAssignment,
+    AppSettingsUpdateRequest,
+    AutomationSettingsPayload,
+    ChatImageAttachment,
+    ChatRequest,
+    ChatResponse,
+    ConversationHistoryResponse,
+    ConversationListResponse,
+    ControlActionPayload,
+    ControlActionResult,
+    CreateConversationRequest,
+    CreateTaskAgentRequest,
+    CreateWorkflowTaskRequest,
+    ElementLookupRequest,
+    ElementLookupResponse,
+    HealthResponse,
+    OcrRequest,
+    OcrResponse,
+    ProviderCapabilitiesResponse,
+    ProviderHealthResponse,
+    ProviderHealthSweepResponse,
+    ProviderSettingsPayload,
+    ProviderType,
+    ScriptExecutionPrepareRequest,
+    ScriptExecutionPreviewResponse,
+    ScriptExecutionResponse,
+    ScriptExecutionRunRequest,
+    ScreenshotResponse,
+    SettingsSnapshot,
+    SystemInfoResponse,
+    UiStatePayload,
+    WorkflowApprovalDecisionRequest,
+    WorkflowAgentTreeResponse,
+    WorkflowRunResponse,
+    WorkflowTaskDetail,
+    WorkflowTaskDetailListResponse,
+    WorkflowTaskListResponse,
+)
+from agent_studio.core.state import SharedState
+from agent_studio.services.automation.input_controller import InputController
+from agent_studio.services.conversation_service import ConversationService
+from agent_studio.services.automation.permission_manager import PermissionManager
+from agent_studio.services.model_router import ModelRouter
+from agent_studio.services.perception.perception_service import PerceptionService
+from agent_studio.services.system.system_service import SystemService
+from agent_studio.services.workflows.workflow_service import WorkflowService
+
+
+def build_router(
+    config: AppConfig,
+    state: SharedState,
+    model_router: ModelRouter,
+    permission_manager: PermissionManager,
+    input_controller: InputController,
+    conversation_service: ConversationService | None,
+    perception_service: PerceptionService | None,
+    workflow_service: WorkflowService | None = None,
+    system_service: SystemService | None = None,
+) -> APIRouter:
+    router = APIRouter(prefix="/api")
+
+    @router.get("/health", response_model=HealthResponse)
+    async def health() -> HealthResponse:
+        provider = state.get_provider_settings()
+        automation = state.get_automation_settings()
+        return HealthResponse(
+            app_name=config.app_name,
+            backend_url=config.backend_url,
+            provider=provider.provider,
+            control_mode=automation.control_mode,
+            input_controller=input_controller.controller_name,
+            event_count=len(state.get_recent_events()),
+        )
+
+    @router.get("/settings", response_model=SettingsSnapshot)
+    async def settings() -> SettingsSnapshot:
+        return SettingsSnapshot(
+            provider=state.get_provider_settings(),
+            automation=state.get_automation_settings(),
+            ui=state.get_ui_state(),
+            recent_events=state.get_recent_events(),
+        )
+
+    @router.post("/settings/provider/update", response_model=SettingsSnapshot)
+    async def set_provider_settings(payload: ProviderSettingsPayload) -> SettingsSnapshot:
+        provider = state.update_provider_settings(payload)
+        return SettingsSnapshot(
+            provider=provider,
+            automation=state.get_automation_settings(),
+            ui=state.get_ui_state(),
+            recent_events=state.get_recent_events(),
+        )
+
+    @router.post("/settings/automation", response_model=SettingsSnapshot)
+    async def set_automation_settings(
+        payload: AutomationSettingsPayload,
+    ) -> SettingsSnapshot:
+        automation = state.update_automation_settings(payload)
+        return SettingsSnapshot(
+            provider=state.get_provider_settings(),
+            automation=automation,
+            ui=state.get_ui_state(),
+            recent_events=state.get_recent_events(),
+        )
+
+    @router.post("/settings/ui", response_model=SettingsSnapshot)
+    async def set_ui_settings(payload: UiStatePayload) -> SettingsSnapshot:
+        ui_state = state.update_ui_state(payload)
+        return SettingsSnapshot(
+            provider=state.get_provider_settings(),
+            automation=state.get_automation_settings(),
+            ui=ui_state,
+            recent_events=state.get_recent_events(),
+        )
+
+    @router.post("/settings/apply", response_model=SettingsSnapshot)
+    async def apply_settings(payload: AppSettingsUpdateRequest) -> SettingsSnapshot:
+        if payload.provider is not None:
+            state.update_provider_settings(payload.provider)
+        if payload.automation is not None:
+            state.update_automation_settings(payload.automation)
+        if payload.ui is not None:
+            state.update_ui_state(payload.ui)
+        return SettingsSnapshot(
+            provider=state.get_provider_settings(),
+            automation=state.get_automation_settings(),
+            ui=state.get_ui_state(),
+            recent_events=state.get_recent_events(),
+        )
+
+    @router.post("/provider/health", response_model=ProviderHealthResponse)
+    async def check_provider_health(
+        payload: ProviderSettingsPayload,
+    ) -> ProviderHealthResponse:
+        try:
+            result = await model_router.check_provider(payload)
+            state.append_event(
+                f"Provider health check completed for {payload.provider.value}: {'ok' if result.ok else 'failed'}."
+            )
+            return result
+        except Exception as exc:  # pragma: no cover - surfaced to UI
+            state.append_event(f"Provider health check failed: {exc}")
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @router.post("/provider/health/all", response_model=ProviderHealthSweepResponse)
+    async def check_all_provider_health(
+        payload: ProviderSettingsPayload,
+    ) -> ProviderHealthSweepResponse:
+        try:
+            result = await model_router.check_all_providers(payload)
+            state.append_event(
+                "Provider sweep completed: "
+                f"{result.ok_count}/{len(result.results)} routes ready."
+            )
+            return result
+        except Exception as exc:  # pragma: no cover - surfaced to UI
+            state.append_event(f"Provider sweep failed: {exc}")
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @router.post("/provider/capabilities", response_model=ProviderCapabilitiesResponse)
+    async def describe_provider_capabilities(
+        payload: ProviderSettingsPayload,
+    ) -> ProviderCapabilitiesResponse:
+        return model_router.describe_capabilities(payload)
+
+    @router.get("/system/info", response_model=SystemInfoResponse)
+    async def get_system_info() -> SystemInfoResponse:
+        _require_system_service(system_service)
+        return system_service.get_system_info()
+
+    @router.post(
+        "/system/script/prepare",
+        response_model=ScriptExecutionPreviewResponse,
+    )
+    async def prepare_script_execution(
+        payload: ScriptExecutionPrepareRequest,
+    ) -> ScriptExecutionPreviewResponse:
+        _require_system_service(system_service)
+        preview = await system_service.prepare_script_execution(payload)
+        state.append_event(
+            f"Prepared script execution request {preview.confirmation_id} ({preview.runtime.value})."
+        )
+        return preview
+
+    @router.post(
+        "/system/script/execute",
+        response_model=ScriptExecutionResponse,
+    )
+    async def execute_prepared_script(
+        payload: ScriptExecutionRunRequest,
+    ) -> ScriptExecutionResponse:
+        _require_system_service(system_service)
+        try:
+            result = system_service.execute_prepared_script(payload)
+        except ValueError as exc:
+            state.append_event(f"Script execution blocked: {exc}")
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        state.append_event(
+            f"Script execution {'completed' if result.ok else 'finished with errors'}: "
+            f"{result.confirmation_id}."
+        )
+        return result
+
+    @router.post("/perception/capture", response_model=ScreenshotResponse)
+    async def capture_screen() -> ScreenshotResponse:
+        _require_perception_service(perception_service)
+        result = perception_service.capture_screen()
+        if result.ok and result.image_path:
+            state.update_ui_state(UiStatePayload(latest_capture_path=result.image_path))
+            state.append_event(f"Screenshot captured: {result.image_path}")
+        else:
+            state.append_event(f"Screenshot capture failed: {result.message}")
+        return result
+
+    @router.post("/perception/ocr", response_model=OcrResponse)
+    async def run_ocr(payload: OcrRequest) -> OcrResponse:
+        _require_perception_service(perception_service)
+        image_path = _resolve_image_path(state=state, image_path=payload.image_path)
+        result = perception_service.run_ocr(image_path)
+        state.append_event(
+            f"OCR {'completed' if result.ok else 'failed'} for {image_path}."
+        )
+        return result
+
+    @router.post("/perception/find", response_model=ElementLookupResponse)
+    async def find_text(payload: ElementLookupRequest) -> ElementLookupResponse:
+        _require_perception_service(perception_service)
+        image_path = _resolve_image_path(state=state, image_path=payload.image_path)
+        result = perception_service.find_text(
+            image_path=image_path,
+            query=payload.query,
+            case_sensitive=payload.case_sensitive,
+        )
+        state.append_event(
+            f"Element lookup for '{payload.query}' returned {len(result.matches)} matches."
+        )
+        return result
+
+    @router.get("/conversations", response_model=ConversationListResponse)
+    async def list_conversations() -> ConversationListResponse:
+        _require_conversation_service(conversation_service)
+        return conversation_service.list_conversations()
+
+    @router.post("/conversations", response_model=ConversationHistoryResponse)
+    async def create_conversation(
+        payload: CreateConversationRequest,
+    ) -> ConversationHistoryResponse:
+        _require_conversation_service(conversation_service)
+        summary = conversation_service.create_conversation(payload.title)
+        state.update_ui_state(UiStatePayload(current_conversation_id=summary.conversation_id))
+        return conversation_service.get_history(summary.conversation_id)
+
+    @router.get(
+        "/conversations/{conversation_id}",
+        response_model=ConversationHistoryResponse,
+    )
+    async def get_conversation(conversation_id: str) -> ConversationHistoryResponse:
+        _require_conversation_service(conversation_service)
+        try:
+            return conversation_service.get_history(conversation_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @router.get(
+        "/conversations/{conversation_id}/tasks",
+        response_model=WorkflowTaskListResponse,
+    )
+    async def list_conversation_tasks(conversation_id: str) -> WorkflowTaskListResponse:
+        _require_workflow_service(workflow_service)
+        return workflow_service.list_tasks(conversation_id=conversation_id)
+
+    @router.get(
+        "/conversations/{conversation_id}/tasks/details",
+        response_model=WorkflowTaskDetailListResponse,
+    )
+    async def list_conversation_task_details(
+        conversation_id: str,
+    ) -> WorkflowTaskDetailListResponse:
+        _require_workflow_service(workflow_service)
+        return WorkflowTaskDetailListResponse(
+            tasks=await workflow_service.list_task_details_for_conversation(conversation_id)
+        )
+
+    @router.post("/chat", response_model=ChatResponse)
+    async def chat(payload: ChatRequest) -> ChatResponse:
+        try:
+            conversation_id = payload.conversation_id
+            latest_image_path = _latest_attachment_path(payload.attachments)
+            if latest_image_path:
+                state.update_ui_state(UiStatePayload(latest_capture_path=latest_image_path))
+            if conversation_service is not None:
+                summary = conversation_service.ensure_conversation(
+                    conversation_id=payload.conversation_id,
+                    seed_message=payload.message or _first_attachment_label(payload.attachments),
+                )
+                conversation_id = summary.conversation_id
+                state.update_ui_state(
+                    UiStatePayload(current_conversation_id=conversation_id)
+                )
+                conversation_service.append_message(
+                    conversation_id=conversation_id,
+                    role="user",
+                    content=payload.message,
+                    attachments=_attachments_for_storage(payload.attachments),
+                )
+            if workflow_service is not None and conversation_id is not None:
+                task_request = CreateWorkflowTaskRequest(
+                    title=None,
+                    conversation_id=conversation_id,
+                    instruction=payload.message
+                    or _first_attachment_label(payload.attachments)
+                    or "Review the current desktop state and complete the requested goal.",
+                    model_assignment=AgentModelAssignment(
+                        provider=ProviderType.OLLAMA,
+                        model=config.default_local_model,
+                        base_url=config.ollama_base_url,
+                        assignment_reason="Chat tasks default to the local multimodal model.",
+                    ),
+                    autonomous=True,
+                    max_iterations=8,
+                    preferred_language="system",
+                    steps=[],
+                )
+                task = workflow_service.create_task(task_request)
+                task = (await workflow_service.run_task(task.task_id)).task
+                response = _build_chat_task_response(
+                    payload=payload,
+                    conversation_id=conversation_id,
+                    task=task,
+                    config=config,
+                )
+                if conversation_service is not None:
+                    conversation_service.append_message(
+                        conversation_id=conversation_id,
+                        role="assistant",
+                        content=response.content,
+                    )
+                state.append_event(
+                    f"Chat created autonomous task {task.task_id} for conversation {conversation_id}."
+                )
+                return response
+
+            response = await model_router.chat(
+                payload.model_copy(update={"conversation_id": conversation_id})
+            )
+
+            if conversation_service is not None and conversation_id is not None:
+                conversation_service.append_message(
+                    conversation_id=conversation_id,
+                    role="assistant",
+                    content=response.content,
+                )
+                response = response.model_copy(
+                    update={"conversation_id": conversation_id}
+                )
+            if response.fallback_used:
+                attempted = " -> ".join(
+                    provider.value for provider in response.attempted_providers
+                )
+                state.append_event(
+                    f"Chat response used fallback route {attempted}: {response.fallback_reason}"
+                )
+            else:
+                state.append_event(
+                    f"Chat response generated by {response.provider.value}"
+                    f" with {response.attachment_count} image attachment(s)."
+                )
+            return response
+        except Exception as exc:  # pragma: no cover - surfaced to UI
+            state.append_event(f"Chat request failed: {exc}")
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @router.get("/tasks", response_model=WorkflowTaskListResponse)
+    async def list_tasks() -> WorkflowTaskListResponse:
+        _require_workflow_service(workflow_service)
+        return workflow_service.list_tasks()
+
+    @router.post("/tasks", response_model=WorkflowTaskDetail)
+    async def create_task(payload: CreateWorkflowTaskRequest) -> WorkflowTaskDetail:
+        _require_workflow_service(workflow_service)
+        try:
+            return workflow_service.create_task(payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.get("/tasks/{task_id}", response_model=WorkflowTaskDetail)
+    async def get_task(task_id: str) -> WorkflowTaskDetail:
+        _require_workflow_service(workflow_service)
+        try:
+            return await workflow_service.get_task(task_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @router.post("/tasks/{task_id}/agents", response_model=WorkflowTaskDetail)
+    async def add_agent(
+        task_id: str,
+        payload: CreateTaskAgentRequest,
+    ) -> WorkflowTaskDetail:
+        _require_workflow_service(workflow_service)
+        try:
+            return workflow_service.add_agent(task_id=task_id, request=payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.get("/tasks/{task_id}/agents/tree", response_model=WorkflowAgentTreeResponse)
+    async def get_agent_tree(task_id: str) -> WorkflowAgentTreeResponse:
+        _require_workflow_service(workflow_service)
+        try:
+            return workflow_service.get_agent_tree(task_id=task_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @router.post("/tasks/{task_id}/run", response_model=WorkflowRunResponse)
+    async def run_task(task_id: str) -> WorkflowRunResponse:
+        _require_workflow_service(workflow_service)
+        try:
+            return await workflow_service.run_task(task_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.post("/tasks/{task_id}/approve", response_model=WorkflowRunResponse)
+    async def approve_task_pending_step(
+        task_id: str,
+        payload: WorkflowApprovalDecisionRequest,
+    ) -> WorkflowRunResponse:
+        _require_workflow_service(workflow_service)
+        try:
+            return await workflow_service.approve_pending_step(
+                task_id,
+                decision=payload.decision,
+                extra_prompt=payload.extra_prompt,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.post("/automation/demo", response_model=ControlActionResult)
+    async def automation_demo(payload: ControlActionPayload) -> ControlActionResult:
+        decision = permission_manager.evaluate(reason=f"demo:{payload.action.value}")
+        if not decision.allowed:
+            state.append_event(
+                f"Control request blocked by mode {decision.mode.value}: {payload.action.value}."
+            )
+            return ControlActionResult(
+                allowed=False,
+                executed=False,
+                message=decision.message,
+                event=f"blocked:{payload.action.value}",
+            )
+
+        return input_controller.execute(payload)
+
+    return router
+
+
+def _require_conversation_service(
+    conversation_service: ConversationService | None,
+) -> None:
+    if conversation_service is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Conversation persistence is unavailable in this runtime.",
+        )
+
+
+def _require_perception_service(perception_service: PerceptionService | None) -> None:
+    if perception_service is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Perception services are unavailable in this runtime.",
+        )
+
+
+def _require_workflow_service(workflow_service: WorkflowService | None) -> None:
+    if workflow_service is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Workflow services are unavailable in this runtime.",
+        )
+
+
+def _require_system_service(system_service: SystemService | None) -> None:
+    if system_service is None:
+        raise HTTPException(
+            status_code=503,
+            detail="System services are unavailable in this runtime.",
+        )
+
+
+def _resolve_image_path(state: SharedState, image_path: str | None) -> str:
+    if image_path:
+        return image_path
+    latest_capture_path = state.get_ui_state().latest_capture_path
+    if latest_capture_path:
+        return latest_capture_path
+    raise HTTPException(
+        status_code=400,
+        detail="No image_path was provided and no latest capture is available yet.",
+    )
+
+
+def _attachments_for_storage(
+    attachments: list[ChatImageAttachment],
+) -> list[ChatImageAttachment]:
+    stored: list[ChatImageAttachment] = []
+    for attachment in attachments:
+        normalized_name = attachment.name
+        if not normalized_name and attachment.image_path:
+            normalized_name = attachment.image_path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+        if not normalized_name:
+            normalized_name = "inline-image"
+        stored.append(
+            attachment.model_copy(
+                update={
+                    "name": normalized_name,
+                    "image_base64": None,
+                }
+            )
+        )
+    return stored
+
+
+def _first_attachment_label(attachments: list[ChatImageAttachment]) -> str | None:
+    for attachment in attachments:
+        if attachment.name:
+            return attachment.name
+        if attachment.image_path:
+            return attachment.image_path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+    return None
+
+
+def _latest_attachment_path(attachments: list[ChatImageAttachment]) -> str | None:
+    for attachment in reversed(attachments):
+        if attachment.image_path:
+            return attachment.image_path
+    return None
