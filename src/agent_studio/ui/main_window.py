@@ -713,8 +713,7 @@ class MainWindow(QtWidgets.QMainWindow):
             refs.agent_tabs.addTab(browser, self._agent_tab_label(agent))
 
     def _render_task_summary(self, task: dict) -> str:
-        title = escape(str(task.get("title", "")))
-        task_id = escape(str(task.get("task_id", "")))
+        title = escape(str(task.get("title", self._t("activity"))).strip() or self._t("activity"))
         status = escape(self._task_status_label(str(task.get("status", "draft"))))
         last_message = escape(str(task.get("last_message") or self._t("label_none")))
         agents = task.get("agents", [])
@@ -722,7 +721,6 @@ class MainWindow(QtWidgets.QMainWindow):
         html: list[str] = [
             f"<h3>{title}</h3>",
             "<table>",
-            f"<tr><td><b>ID</b></td><td>{task_id}</td></tr>",
             f"<tr><td><b>{escape(self._t('task_status'))}</b></td><td>{status}</td></tr>",
             f"<tr><td><b>{escape(self._t('task_agents'))}</b></td><td>{len(agents)}</td></tr>",
             f"<tr><td><b>{escape(self._t('task_last_message'))}</b></td><td>{last_message}</td></tr>",
@@ -767,6 +765,11 @@ class MainWindow(QtWidgets.QMainWindow):
         instruction = escape(str(agent.get("instruction") or self._t("label_none")))
         autonomous = bool(agent.get("autonomous", False))
         max_iterations = int(agent.get("max_iterations", 0) or 0)
+        mode_label = (
+            self._t("agent_mode_autonomous")
+            if autonomous
+            else self._t("agent_mode_seeded")
+        )
         assignment = agent.get("model_assignment") or {}
         provider = assignment.get("provider") or self._t("label_inherit")
         model = assignment.get("model") or self._t("label_inherit")
@@ -784,10 +787,11 @@ class MainWindow(QtWidgets.QMainWindow):
             "<table>",
             f"<tr><td><b>{escape(self._t('agent_status'))}</b></td><td>{status}</td></tr>",
             f"<tr><td><b>{escape(self._t('agent_instruction'))}</b></td><td>{instruction}</td></tr>",
-            f"<tr><td><b>{escape(self._t('agent_turns'))}</b></td><td>{self._bool_label(autonomous)} | {max_iterations}</td></tr>",
+            f"<tr><td><b>{escape(self._t('agent_mode'))}</b></td><td>{escape(mode_label)}</td></tr>",
+            f"<tr><td><b>{escape(self._t('agent_turns'))}</b></td><td>{max_iterations}</td></tr>",
             f"<tr><td><b>{escape(self._t('agent_model'))}</b></td><td>{escape(str(provider))} / {escape(str(model))}<br>{escape(str(base_url))}</td></tr>",
             f"<tr><td><b>{escape(self._t('agent_assignment_reason'))}</b></td><td>{escape(str(reason))}</td></tr>",
-            f"<tr><td><b>{escape(self._t('task_agents'))}</b></td><td>{child_count}</td></tr>",
+            f"<tr><td><b>{escape(self._t('agent_children'))}</b></td><td>{child_count}</td></tr>",
             "</table>",
         ]
 
@@ -1262,7 +1266,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _task_tab_label(self, task: dict) -> str:
         title = str(task.get("title", self._t("activity"))).strip() or self._t("activity")
-        return f"{title[:21]}..." if len(title) > 24 else title
+        status = self._task_status_label(str(task.get("status", "draft")))
+        label = f"{status} · {title}"
+        return f"{label[:27]}..." if len(label) > 30 else label
 
     def _agent_tab_label(self, agent: dict) -> str:
         name = str(agent.get("name", "Agent")).strip() or "Agent"

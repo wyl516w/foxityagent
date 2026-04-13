@@ -2,6 +2,12 @@
 
 ## 2026-04-13
 
+- Entered phase G / step 4 and refined the right-hand workspace in `src/agent_studio/ui/main_window.py` so it reads more like a conversation execution view than a workflow console.
+- Updated the right-side run tabs to be status-first, removed the raw task ID from the visible summary, and re-labeled the run and agent sections around active agents, recent actions, child agents, and approval state instead of workflow-first wording.
+- Replaced the corrupted translation table in `src/agent_studio/ui/i18n.py` with a clean UTF-8 language map for English and Simplified Chinese, including the updated conversation-first wording for the main shell and settings dialog.
+- Updated `实现计划.md` and `用户手册.md` so the current stage now reflects the cleaner conversation execution view and the repaired bilingual UI text.
+- Verified phase G / step 4 with `.venv\\Scripts\\python.exe -m py_compile src/agent_studio/ui/main_window.py src/agent_studio/ui/i18n.py src/agent_studio/ui/settings_dialog.py` and `.venv\\Scripts\\python.exe -m ruff check src/agent_studio/ui/main_window.py src/agent_studio/ui/i18n.py src/agent_studio/ui/settings_dialog.py`.
+
 - Resolved the `git pull` merge conflicts in `实现计划.md`, `用户手册.md`, and `checklog.md` by keeping the local conversation-first product direction and rewriting the files cleanly.
 - Entered phase G / step 3 and updated `src/agent_studio/api/routes.py` so `/api/chat` now creates autonomous conversation tasks with the current configured provider settings instead of hardcoding the local Ollama route.
 - Updated `src/agent_studio/services/backend_server.py` so `BackendServer.start()` fails fast when `/api/health` does not become ready within eight seconds, instead of logging a false-success startup event.
