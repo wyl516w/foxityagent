@@ -539,3 +539,72 @@ def _latest_attachment_path(attachments: list[ChatImageAttachment]) -> str | Non
         if attachment.image_path:
             return attachment.image_path
     return None
+
+
+def _build_chat_task_response(
+    *,
+    payload: ChatRequest,
+    conversation_id: str,
+    task: WorkflowTaskDetail,
+    config: AppConfig,
+) -> ChatResponse:
+    root_agent = next(
+        (agent for agent in task.agents if agent.parent_agent_id is None),
+        task.agents[0] if task.agents else None,
+    )
+    assignment = root_agent.model_assignment if root_agent is not None else None
+    provider = (
+        assignment.provider
+        if assignment is not None and assignment.provider is not None
+        else ProviderType.OLLAMA
+    )
+    model = (
+        assignment.model
+        if assignment is not None and assignment.model
+        else config.default_local_model
+    )
+
+    status_value = task.status.value
+    content = (task.last_message or "").strip()
+    generic_messages = {
+        "Task is running.",
+        "Task created and ready to run.",
+    }
+    if status_value in {"completed", "failed", "waiting_approval"} and content in generic_messages:
+        content = ""
+    if task.pending_approval:
+        summary = str(task.pending_approval.get("summary") or content).strip()
+        warnings = task.pending_approval.get("warnings") or []
+        lines = [summary or "The task is waiting for approval."]
+        if warnings:
+            lines.append("")
+            lines.extend(f"- {warning}" for warning in warnings[:4])
+        content = "\n".join(lines)
+    elif not content:
+        last_result = next(
+            (result for result in reversed(task.results) if result.message.strip()),
+            None,
+        )
+        if last_result is not None:
+            content = last_result.message.strip()
+    if not content:
+        fallback_messages = {
+            "completed": f"Task '{task.title}' completed.",
+            "waiting_approval": f"Task '{task.title}' is waiting for approval.",
+            "failed": f"Task '{task.title}' failed.",
+        }
+        content = fallback_messages.get(status_value, f"Task '{task.title}' is running.")
+
+    return ChatResponse(
+        provider=provider,
+        model=model,
+        content=content,
+        conversation_id=conversation_id,
+        task_id=task.task_id,
+        task_status=status_value,
+        task_title=task.title,
+        used_mock=provider == ProviderType.MOCK,
+        vision_used=bool(payload.attachments),
+        attachment_count=len(payload.attachments),
+        latency_ms=0,
+    )

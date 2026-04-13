@@ -24,6 +24,7 @@ from agent_studio.core.models import (
 from agent_studio.core.state import SharedState
 from agent_studio.services.automation.noop_controller import NoopInputController
 from agent_studio.services.automation.permission_manager import PermissionManager
+from agent_studio.services.conversation_service import ConversationService
 from agent_studio.services.model_router import ModelRouter
 from agent_studio.services.system.system_service import SystemService
 from agent_studio.services.workflows.workflow_service import WorkflowService
@@ -215,6 +216,99 @@ def test_apply_settings_route_updates_language_without_clobbering_ui_state() -> 
         assert ui_payload["current_conversation_id"] == "conv-7"
         assert ui_payload["latest_capture_path"] == "capture.png"
         assert ui_payload["output_mode"] == "step_summary"
+    finally:
+        shutil.rmtree(test_dir, ignore_errors=True)
+
+
+def test_chat_route_creates_autonomous_task_when_workflow_service_is_enabled() -> None:
+    test_dir = _make_test_dir()
+    try:
+        config = AppConfig(database_path=test_dir / "agent_studio.db")
+        store = SQLiteStore(
+            database_path=config.database_path,
+            event_retention_limit=config.event_retention_limit,
+        )
+        store.initialize()
+        state = SharedState(config=config, store=store)
+        permission_manager = PermissionManager(state=state)
+        input_controller = NoopInputController(
+            state=state,
+            permission_manager=permission_manager,
+        )
+        perception_service = _StubPerceptionService()
+        model_router = _StubAutonomousModelRouter(
+            responses=[
+                '{"status":"continue","summary":"Capture the current screen.","action":{"kind":"capture_screen"}}',
+                '{"status":"complete","summary":"Captured the current screen and finished."}',
+            ]
+        )
+        workflow_service = WorkflowService(
+            store=store,
+            state=state,
+            perception_service=perception_service,
+            input_controller=input_controller,
+            permission_manager=permission_manager,
+            system_service=SystemService(
+                config=config,
+                perception_service=perception_service,
+                state=state,
+                model_router=model_router,
+            ),
+            model_router=model_router,
+        )
+
+        app = FastAPI()
+        app.include_router(
+            build_router(
+                config=config,
+                state=state,
+                model_router=model_router,
+                permission_manager=permission_manager,
+                input_controller=input_controller,
+                conversation_service=ConversationService(store=store),
+                perception_service=perception_service,
+                workflow_service=workflow_service,
+                system_service=SystemService(
+                    config=config,
+                    perception_service=perception_service,
+                    state=state,
+                    model_router=model_router,
+                ),
+            )
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/api/chat",
+            json={"message": "Take a look at the current desktop and report back."},
+        )
+        assert response.status_code == 200
+        payload = response.json()
+
+        assert payload["conversation_id"]
+        assert payload["task_id"]
+        assert payload["task_status"] == "completed"
+        assert payload["task_title"]
+        assert payload["content"]
+        assert any(
+            keyword in payload["content"].lower()
+            for keyword in ("completed", "finished")
+        )
+
+        history = client.get(f"/api/conversations/{payload['conversation_id']}")
+        assert history.status_code == 200
+        history_payload = history.json()
+        assert [message["role"] for message in history_payload["messages"]] == [
+            "user",
+            "assistant",
+        ]
+
+        task_details = client.get(
+            f"/api/conversations/{payload['conversation_id']}/tasks/details"
+        )
+        assert task_details.status_code == 200
+        detail_payload = task_details.json()
+        assert detail_payload["tasks"][0]["task_id"] == payload["task_id"]
     finally:
         shutil.rmtree(test_dir, ignore_errors=True)
 
