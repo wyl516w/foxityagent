@@ -639,6 +639,21 @@ def test_desktop_folder_prompt_uses_seeded_steps_template() -> None:
     assert any(step.kind.value == "left_click" for step in steps)
 
 
+def test_desktop_folder_open_prompt_uses_seeded_steps_without_close() -> None:
+    steps = _desktop_folder_seed_steps(
+        "请帮我查看桌面图标，其中最左上角的文件夹叫什么，用鼠标打开"
+    )
+    assert steps
+    kinds = [step.kind.value for step in steps]
+    assert kinds == [
+        "capture_screen",
+        "analyze_image",
+        "move_mouse",
+        "left_click",
+        "left_click",
+    ]
+
+
 def test_chat_route_seeded_desktop_prompt_sends_captured_image_to_model() -> None:
     test_dir = _make_test_dir()
     try:
@@ -722,6 +737,93 @@ def test_chat_route_seeded_desktop_prompt_sends_captured_image_to_model() -> Non
         attachments = model_router.request_history[0]["attachments"]
         assert attachments
         assert attachments[0]["image_path"] == "C:/tmp/workflow-capture.png"
+    finally:
+        shutil.rmtree(test_dir, ignore_errors=True)
+
+
+def test_chat_route_top_left_folder_open_prompt_uses_seeded_steps() -> None:
+    test_dir = _make_test_dir()
+    try:
+        config = AppConfig(database_path=test_dir / "agent_studio.db")
+        store = SQLiteStore(
+            database_path=config.database_path,
+            event_retention_limit=config.event_retention_limit,
+        )
+        store.initialize()
+        state = SharedState(config=config, store=store)
+        state.update_automation_settings(
+            AutomationSettingsPayload(control_mode=ControlMode.ALLOW_SESSION)
+        )
+        permission_manager = PermissionManager(state=state)
+        input_controller = NoopInputController(
+            state=state,
+            permission_manager=permission_manager,
+        )
+        perception_service = _StubPerceptionService()
+        model_router = _StubAutonomousModelRouter(
+            responses=[
+                (
+                    '{"summary":"可见桌面文件夹共8个，第一个在左上角的文件夹名为testtest",'
+                    '"suggested_steps":[]}'
+                )
+            ]
+        )
+        workflow_service = WorkflowService(
+            store=store,
+            state=state,
+            perception_service=perception_service,
+            input_controller=input_controller,
+            permission_manager=permission_manager,
+            system_service=SystemService(
+                config=config,
+                perception_service=perception_service,
+                state=state,
+                model_router=model_router,
+            ),
+            model_router=model_router,
+        )
+
+        app = FastAPI()
+        app.include_router(
+            build_router(
+                config=config,
+                state=state,
+                model_router=model_router,
+                permission_manager=permission_manager,
+                input_controller=input_controller,
+                conversation_service=ConversationService(store=store),
+                perception_service=perception_service,
+                workflow_service=workflow_service,
+                system_service=SystemService(
+                    config=config,
+                    perception_service=perception_service,
+                    state=state,
+                    model_router=model_router,
+                ),
+            )
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/api/chat",
+            json={"message": "请帮我查看桌面图标，其中最左上角的文件夹叫什么，用鼠标打开"},
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["task_status"] == "completed"
+        assert payload["content"] == "可见桌面文件夹共8个，第一个在左上角的文件夹名为testtest"
+        assert payload["vision_used"] is True
+        assert payload["attachment_count"] >= 1
+
+        task_id = payload["task_id"]
+        task_payload = client.get(f"/api/tasks/{task_id}").json()
+        assert [step["kind"] for step in task_payload["steps"]] == [
+            "capture_screen",
+            "analyze_image",
+            "move_mouse",
+            "left_click",
+            "left_click",
+        ]
     finally:
         shutil.rmtree(test_dir, ignore_errors=True)
 

@@ -839,16 +839,26 @@ def _desktop_folder_seed_steps(message: str) -> list[WorkflowStepDefinition]:
     normalized = " ".join((message or "").strip().lower().split())
     if not normalized:
         return []
-    zh_match = all(keyword in normalized for keyword in ("桌面", "文件夹", "左上角"))
+    zh_scope_match = "桌面" in normalized or "图标" in normalized
+    zh_target_match = "文件夹" in normalized and "左上角" in normalized
+    zh_intent_match = any(
+        keyword in normalized for keyword in ("叫什么", "名称", "名字", "打开", "双击", "关闭")
+    )
+    zh_match = zh_scope_match and zh_target_match and zh_intent_match
     en_match = (
         "desktop" in normalized
         and "folder" in normalized
         and ("top-left" in normalized or "top left" in normalized)
+        and any(keyword in normalized for keyword in ("name", "open", "double click", "close"))
+    )
+    if not (zh_match or en_match):
+        return []
+    open_match = any(
+        keyword in normalized for keyword in ("打开", "双击", "open", "double click")
     )
     close_match = "关闭" in normalized or "close" in normalized
-    if not close_match or not (zh_match or en_match):
-        return []
-    return [
+    needs_open = open_match or close_match
+    steps: list[WorkflowStepDefinition] = [
         WorkflowStepDefinition(
             kind=WorkflowStepType.CAPTURE_SCREEN,
             label="Capture Desktop",
@@ -861,26 +871,37 @@ def _desktop_folder_seed_steps(message: str) -> list[WorkflowStepDefinition]:
                 "and answer in concise Chinese with folder count and folder name."
             ),
         ),
-        WorkflowStepDefinition(
-            kind=WorkflowStepType.MOVE_MOUSE,
-            label="Move To Top-Left Folder",
-            text="80,80",
-        ),
-        WorkflowStepDefinition(
-            kind=WorkflowStepType.LEFT_CLICK,
-            label="Open Folder Click 1",
-        ),
-        WorkflowStepDefinition(
-            kind=WorkflowStepType.LEFT_CLICK,
-            label="Open Folder Click 2",
-        ),
-        WorkflowStepDefinition(
-            kind=WorkflowStepType.MOVE_MOUSE,
-            label="Move To Close Button",
-            text="1910,12",
-        ),
-        WorkflowStepDefinition(
-            kind=WorkflowStepType.LEFT_CLICK,
-            label="Close Window Click",
-        ),
     ]
+    if needs_open:
+        steps.extend(
+            [
+                WorkflowStepDefinition(
+                    kind=WorkflowStepType.MOVE_MOUSE,
+                    label="Move To Top-Left Folder",
+                    text="80,80",
+                ),
+                WorkflowStepDefinition(
+                    kind=WorkflowStepType.LEFT_CLICK,
+                    label="Open Folder Click 1",
+                ),
+                WorkflowStepDefinition(
+                    kind=WorkflowStepType.LEFT_CLICK,
+                    label="Open Folder Click 2",
+                ),
+            ]
+        )
+    if close_match:
+        steps.extend(
+            [
+                WorkflowStepDefinition(
+                    kind=WorkflowStepType.MOVE_MOUSE,
+                    label="Move To Close Button",
+                    text="1910,12",
+                ),
+                WorkflowStepDefinition(
+                    kind=WorkflowStepType.LEFT_CLICK,
+                    label="Close Window Click",
+                ),
+            ]
+        )
+    return steps
