@@ -948,6 +948,11 @@ class WorkflowService:
                     ),
                     settings_override=model_settings,
                 )
+                self._state.append_event(
+                    "Analyze image sent screenshot "
+                    f"{image_path} to {response.provider.value}/{response.model} "
+                    f"with {response.attachment_count} attachment(s)."
+                )
                 analysis = _parse_analysis_response(
                     response.content,
                     fallback_image_path=image_path,
@@ -1436,6 +1441,13 @@ def _build_autonomous_request(
             ),
             "For find_text, type_text, and execute_script, provide action.text.",
             "For run_ocr, find_text, or analyze_image, you may provide action.image_path.",
+            (
+                "When visual context is needed, always prefer capture_screen then analyze_image "
+                "so the latest screenshot is sent to the model as an image attachment."
+            ),
+            (
+                "Use run_ocr only when the task explicitly requires exact OCR-style text extraction."
+            ),
             "For execute_script, you may provide action.runtime as auto, python, or shell.",
             "Do not ask the operator to break the goal into steps for you; choose the next tool yourself.",
             "Use delegate only when a child agent should take over a clear sub-goal.",

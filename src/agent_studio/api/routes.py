@@ -686,6 +686,7 @@ def _build_chat_task_response(
             "failed": f"Task '{task.title}' failed.",
         }
         content = fallback_messages.get(status_value, f"Task '{task.title}' is running.")
+    task_vision_used, task_attachment_count = _task_vision_usage(task)
 
     return ChatResponse(
         provider=provider,
@@ -696,8 +697,8 @@ def _build_chat_task_response(
         task_status=status_value,
         task_title=task.title,
         used_mock=provider == ProviderType.MOCK,
-        vision_used=bool(payload.attachments),
-        attachment_count=len(payload.attachments),
+        vision_used=bool(payload.attachments) or task_vision_used,
+        attachment_count=max(len(payload.attachments), task_attachment_count),
         latency_ms=0,
     )
 
@@ -762,13 +763,16 @@ def _merge_chat_response_with_task(
     conversation_id: str | None,
     task: WorkflowTaskDetail | None,
 ) -> ChatResponse:
-    updates: dict[str, str | None] = {"conversation_id": conversation_id}
+    updates: dict[str, object | None] = {"conversation_id": conversation_id}
     if task is not None:
+        task_vision_used, task_attachment_count = _task_vision_usage(task)
         updates.update(
             {
                 "task_id": task.task_id,
                 "task_status": task.status.value,
                 "task_title": task.title,
+                "vision_used": response.vision_used or task_vision_used,
+                "attachment_count": max(response.attachment_count, task_attachment_count),
             }
         )
     return response.model_copy(update=updates)
@@ -804,12 +808,30 @@ def _pick_useful_result_message(task: WorkflowTaskDetail) -> str:
     return ""
 
 
+def _task_vision_usage(task: WorkflowTaskDetail) -> tuple[bool, int]:
+    used = False
+    attachment_count = 0
+    for result in task.results:
+        if result.kind != WorkflowStepType.ANALYZE_IMAGE:
+            continue
+        used = True
+        output = result.output or {}
+        if isinstance(output, dict):
+            raw = output.get("attachment_count")
+            if isinstance(raw, int) and raw > 0:
+                attachment_count += raw
+                continue
+        attachment_count += 1
+    return used, attachment_count
+
+
 def _is_control_only_message(content: str) -> bool:
     lowered = content.strip().lower()
     return (
         lowered.startswith("mouse moved to ")
         or lowered == "left click executed."
         or lowered.startswith("typed ")
+        or "this platform is using the noop controller" in lowered
     )
 
 

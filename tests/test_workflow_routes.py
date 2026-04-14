@@ -86,6 +86,7 @@ class _StubAutonomousModelRouter:
     def __init__(self, responses: list[str]) -> None:
         self._responses = list(responses)
         self.settings_history: list[dict | None] = []
+        self.request_history: list[dict] = []
 
     async def chat(
         self,
@@ -96,6 +97,7 @@ class _StubAutonomousModelRouter:
     ) -> ChatResponse:
         if not self._responses:
             raise AssertionError("No stub planner responses remain.")
+        self.request_history.append(request.model_dump(mode="json"))
         self.settings_history.append(
             settings_override.model_dump(mode="json") if settings_override else None
         )
@@ -520,6 +522,112 @@ def test_chat_route_falls_back_when_autonomous_response_is_low_signal() -> None:
         shutil.rmtree(test_dir, ignore_errors=True)
 
 
+def test_chat_fallback_still_reports_task_vision_usage() -> None:
+    test_dir = _make_test_dir()
+    try:
+        config = AppConfig(database_path=test_dir / "agent_studio.db")
+        store = SQLiteStore(
+            database_path=config.database_path,
+            event_retention_limit=config.event_retention_limit,
+        )
+        store.initialize()
+        state = SharedState(config=config, store=store)
+        permission_manager = PermissionManager(state=state)
+        input_controller = NoopInputController(
+            state=state,
+            permission_manager=permission_manager,
+        )
+        perception_service = _StubPerceptionService()
+        model_router = _StubAutonomousModelRouter(
+            responses=["Direct fallback content after task failure."]
+        )
+        workflow_service = WorkflowService(
+            store=store,
+            state=state,
+            perception_service=perception_service,
+            input_controller=input_controller,
+            permission_manager=permission_manager,
+            system_service=SystemService(
+                config=config,
+                perception_service=perception_service,
+                state=state,
+                model_router=model_router,
+            ),
+            model_router=model_router,
+        )
+
+        async def _failed_run_task_with_vision(task_id: str) -> WorkflowRunResponse:
+            created = store.get_task(task_id)
+            assert created is not None
+            payload = store.get_task_payload(task_id) or {}
+            payload["steps"] = [{"kind": "analyze_image", "image_path": "C:/tmp/workflow-capture.png"}]
+            payload["results"] = [
+                {
+                    "index": 1,
+                    "kind": "analyze_image",
+                    "agent_id": "agent-vision",
+                    "agent_name": "Vision Agent",
+                    "label": "Analyze",
+                    "ok": True,
+                    "message": "8 folders, first folder: testtest",
+                    "output": {
+                        "image_path": "C:/tmp/workflow-capture.png",
+                        "provider": "ollama",
+                        "model": "qwen3-vl:4b",
+                        "content": "8 folders, first folder: testtest",
+                        "raw_content": '{"summary":"8 folders, first folder: testtest"}',
+                        "suggested_steps": [],
+                        "vision_used": True,
+                        "attachment_count": 1,
+                    },
+                }
+            ]
+            payload["last_message"] = "Autonomous planning failed: fallback requested."
+            updated = store.update_task(
+                task_id,
+                status=TaskStatus.FAILED.value,
+                payload=payload,
+                title=created.title,
+            )
+            return WorkflowRunResponse(task=updated)
+
+        workflow_service.run_task = _failed_run_task_with_vision  # type: ignore[method-assign]
+
+        app = FastAPI()
+        app.include_router(
+            build_router(
+                config=config,
+                state=state,
+                model_router=model_router,
+                permission_manager=permission_manager,
+                input_controller=input_controller,
+                conversation_service=ConversationService(store=store),
+                perception_service=perception_service,
+                workflow_service=workflow_service,
+                system_service=SystemService(
+                    config=config,
+                    perception_service=perception_service,
+                    state=state,
+                    model_router=model_router,
+                ),
+            )
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/api/chat",
+            json={"message": "Please inspect the desktop and summarize folders."},
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["content"] == "Direct fallback content after task failure."
+        assert payload["task_status"] == TaskStatus.FAILED.value
+        assert payload["vision_used"] is True
+        assert payload["attachment_count"] >= 1
+    finally:
+        shutil.rmtree(test_dir, ignore_errors=True)
+
+
 def test_desktop_folder_prompt_uses_seeded_steps_template() -> None:
     steps = _desktop_folder_seed_steps(
         "截取桌面的图片，然后分析桌面上可见的有多少个文件夹，然后鼠标移到位于左上角第一个文件夹，然后告诉我这个文件夹叫什么，最后关闭这个文件夹"
@@ -529,6 +637,93 @@ def test_desktop_folder_prompt_uses_seeded_steps_template() -> None:
     assert any(step.kind.value == "analyze_image" for step in steps)
     assert any(step.kind.value == "move_mouse" for step in steps)
     assert any(step.kind.value == "left_click" for step in steps)
+
+
+def test_chat_route_seeded_desktop_prompt_sends_captured_image_to_model() -> None:
+    test_dir = _make_test_dir()
+    try:
+        config = AppConfig(database_path=test_dir / "agent_studio.db")
+        store = SQLiteStore(
+            database_path=config.database_path,
+            event_retention_limit=config.event_retention_limit,
+        )
+        store.initialize()
+        state = SharedState(config=config, store=store)
+        state.update_automation_settings(
+            AutomationSettingsPayload(control_mode=ControlMode.ALLOW_SESSION)
+        )
+        permission_manager = PermissionManager(state=state)
+        input_controller = NoopInputController(
+            state=state,
+            permission_manager=permission_manager,
+        )
+        perception_service = _StubPerceptionService()
+        model_router = _StubAutonomousModelRouter(
+            responses=[
+                (
+                    '{"summary":"8 folders, first folder: testtest",'
+                    '"suggested_steps":[]}'
+                )
+            ]
+        )
+        workflow_service = WorkflowService(
+            store=store,
+            state=state,
+            perception_service=perception_service,
+            input_controller=input_controller,
+            permission_manager=permission_manager,
+            system_service=SystemService(
+                config=config,
+                perception_service=perception_service,
+                state=state,
+                model_router=model_router,
+            ),
+            model_router=model_router,
+        )
+
+        app = FastAPI()
+        app.include_router(
+            build_router(
+                config=config,
+                state=state,
+                model_router=model_router,
+                permission_manager=permission_manager,
+                input_controller=input_controller,
+                conversation_service=ConversationService(store=store),
+                perception_service=perception_service,
+                workflow_service=workflow_service,
+                system_service=SystemService(
+                    config=config,
+                    perception_service=perception_service,
+                    state=state,
+                    model_router=model_router,
+                ),
+            )
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/api/chat",
+            json={
+                "message": (
+                    "截取桌面的图片，然后分析桌面上可见的有多少个文件夹，"
+                    "然后鼠标移到位于左上角第一个文件夹，然后告诉我这个文件夹叫什么，最后关闭这个文件夹"
+                )
+            },
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["task_status"] == "completed"
+        assert payload["vision_used"] is True
+        assert payload["attachment_count"] >= 1
+        assert payload["content"] == "8 folders, first folder: testtest"
+
+        assert model_router.request_history
+        attachments = model_router.request_history[0]["attachments"]
+        assert attachments
+        assert attachments[0]["image_path"] == "C:/tmp/workflow-capture.png"
+    finally:
+        shutil.rmtree(test_dir, ignore_errors=True)
 
 
 def test_delete_conversation_removes_associated_tasks() -> None:
