@@ -135,6 +135,7 @@ TRANSLATIONS: Final[dict[str, dict[str, str]]] = {
         "status_chat_task_waiting": "The conversation run is waiting for approval.",
         "status_chat_task_failed": "The conversation run failed. Review the latest agent updates.",
         "status_chat_task_running": "The conversation run is running.",
+        "status_chat_response_ready": "The agent response is ready.",
     },
     "zh-CN": {
         "app_title": "Agent Studio",

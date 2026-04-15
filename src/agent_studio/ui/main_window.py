@@ -1084,7 +1084,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.refresh_current_conversation()
 
         task_status = str(payload.get("task_status") or "").strip()
-        if task_status == "completed":
+        if not task_status:
+            message = self._t("status_chat_response_ready")
+        elif task_status == "completed":
             message = self._t("status_chat_task_completed")
         elif task_status == "waiting_approval":
             message = self._t("status_chat_task_waiting")

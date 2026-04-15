@@ -14,6 +14,7 @@ from agent_studio.core.state import SharedState
 from agent_studio.services.automation.controller_factory import build_input_controller
 from agent_studio.services.automation.permission_manager import PermissionManager
 from agent_studio.services.conversation_service import ConversationService
+from agent_studio.services.desktop import DesktopAgentRuntime
 from agent_studio.services.model_router import ModelRouter
 from agent_studio.services.perception.perception_service import PerceptionService
 from agent_studio.services.system.system_service import SystemService
@@ -34,6 +35,12 @@ class BackendServer:
             ConversationService(store=state.store) if state.store is not None else None
         )
         self.perception_service = PerceptionService(config=config)
+        self.desktop_runtime = DesktopAgentRuntime(
+            state=state,
+            perception_service=self.perception_service,
+            input_controller=self.input_controller,
+            model_router=self.model_router,
+        )
         self.system_service = SystemService(
             config=config,
             perception_service=self.perception_service,
@@ -75,6 +82,7 @@ class BackendServer:
                 input_controller=self.input_controller,
                 conversation_service=self.conversation_service,
                 perception_service=self.perception_service,
+                desktop_runtime=self.desktop_runtime,
                 workflow_service=self.workflow_service,
                 system_service=self.system_service,
             )

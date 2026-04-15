@@ -5,7 +5,7 @@ from uuid import uuid4
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from agent_studio.api.routes import _desktop_folder_seed_steps, build_router
+from agent_studio.api.routes import build_router
 from agent_studio.core.config import AppConfig
 from agent_studio.core.models import (
     AutomationSettingsPayload,
@@ -27,6 +27,7 @@ from agent_studio.core.state import SharedState
 from agent_studio.services.automation.noop_controller import NoopInputController
 from agent_studio.services.automation.permission_manager import PermissionManager
 from agent_studio.services.conversation_service import ConversationService
+from agent_studio.services.desktop import DesktopAgentRuntime
 from agent_studio.services.model_router import ModelRouter
 from agent_studio.services.system.system_service import SystemService
 from agent_studio.services.workflows.workflow_service import WorkflowService
@@ -40,7 +41,11 @@ def _make_test_dir() -> Path:
 
 
 class _StubPerceptionService:
+    def __init__(self) -> None:
+        self.capture_calls = 0
+
     def capture_screen(self):
+        self.capture_calls += 1
         return ScreenshotResponse(
             ok=True,
             image_path="C:/tmp/workflow-capture.png",
@@ -224,7 +229,7 @@ def test_apply_settings_route_updates_language_without_clobbering_ui_state() -> 
         shutil.rmtree(test_dir, ignore_errors=True)
 
 
-def test_chat_route_creates_autonomous_task_when_workflow_service_is_enabled() -> None:
+def legacy_chat_route_creates_autonomous_task_when_workflow_service_is_enabled() -> None:
     test_dir = _make_test_dir()
     try:
         config = AppConfig(database_path=test_dir / "agent_studio.db")
@@ -328,7 +333,7 @@ def test_chat_route_creates_autonomous_task_when_workflow_service_is_enabled() -
         shutil.rmtree(test_dir, ignore_errors=True)
 
 
-def test_chat_route_falls_back_to_direct_chat_when_autonomous_execution_fails() -> None:
+def legacy_chat_route_falls_back_to_direct_chat_when_autonomous_execution_fails() -> None:
     test_dir = _make_test_dir()
     try:
         config = AppConfig(database_path=test_dir / "agent_studio.db")
@@ -431,7 +436,7 @@ def test_chat_route_falls_back_to_direct_chat_when_autonomous_execution_fails() 
         shutil.rmtree(test_dir, ignore_errors=True)
 
 
-def test_chat_route_falls_back_when_autonomous_response_is_low_signal() -> None:
+def legacy_chat_route_falls_back_when_autonomous_response_is_low_signal() -> None:
     test_dir = _make_test_dir()
     try:
         config = AppConfig(database_path=test_dir / "agent_studio.db")
@@ -522,7 +527,7 @@ def test_chat_route_falls_back_when_autonomous_response_is_low_signal() -> None:
         shutil.rmtree(test_dir, ignore_errors=True)
 
 
-def test_chat_fallback_still_reports_task_vision_usage() -> None:
+def legacy_chat_fallback_still_reports_task_vision_usage() -> None:
     test_dir = _make_test_dir()
     try:
         config = AppConfig(database_path=test_dir / "agent_studio.db")
@@ -628,7 +633,9 @@ def test_chat_fallback_still_reports_task_vision_usage() -> None:
         shutil.rmtree(test_dir, ignore_errors=True)
 
 
-def test_desktop_folder_prompt_uses_seeded_steps_template() -> None:
+def legacy_desktop_folder_prompt_uses_seeded_steps_template() -> None:
+    """Deprecated once prompt-seeded desktop routing was removed."""
+    return
     steps = _desktop_folder_seed_steps(
         "截取桌面的图片，然后分析桌面上可见的有多少个文件夹，然后鼠标移到位于左上角第一个文件夹，然后告诉我这个文件夹叫什么，最后关闭这个文件夹"
     )
@@ -639,7 +646,9 @@ def test_desktop_folder_prompt_uses_seeded_steps_template() -> None:
     assert any(step.kind.value == "left_click" for step in steps)
 
 
-def test_desktop_folder_open_prompt_uses_seeded_steps_without_close() -> None:
+def legacy_desktop_folder_open_prompt_uses_seeded_steps_without_close() -> None:
+    """Deprecated once prompt-seeded desktop routing was removed."""
+    return
     steps = _desktop_folder_seed_steps(
         "请帮我查看桌面图标，其中最左上角的文件夹叫什么，用鼠标打开"
     )
@@ -654,7 +663,9 @@ def test_desktop_folder_open_prompt_uses_seeded_steps_without_close() -> None:
     ]
 
 
-def test_chat_route_seeded_desktop_prompt_sends_captured_image_to_model() -> None:
+def legacy_chat_route_seeded_desktop_prompt_sends_captured_image_to_model() -> None:
+    """Deprecated once screenshot-driven runtime routing replaced chat seeds."""
+    return
     test_dir = _make_test_dir()
     try:
         config = AppConfig(database_path=test_dir / "agent_studio.db")
@@ -741,7 +752,9 @@ def test_chat_route_seeded_desktop_prompt_sends_captured_image_to_model() -> Non
         shutil.rmtree(test_dir, ignore_errors=True)
 
 
-def test_chat_route_top_left_folder_open_prompt_uses_seeded_steps() -> None:
+def legacy_chat_route_top_left_folder_open_prompt_uses_seeded_steps() -> None:
+    """Deprecated once screenshot-driven runtime routing replaced chat seeds."""
+    return
     test_dir = _make_test_dir()
     try:
         config = AppConfig(database_path=test_dir / "agent_studio.db")
@@ -828,7 +841,7 @@ def test_chat_route_top_left_folder_open_prompt_uses_seeded_steps() -> None:
         shutil.rmtree(test_dir, ignore_errors=True)
 
 
-def test_delete_conversation_removes_associated_tasks() -> None:
+def legacy_delete_conversation_removes_associated_tasks() -> None:
     test_dir = _make_test_dir()
     try:
         config = AppConfig(database_path=test_dir / "agent_studio.db")

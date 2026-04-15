@@ -113,6 +113,38 @@ class ChatResponse(BaseModel):
     latency_ms: int = 0
 
 
+class DesktopRuntimeStepRequest(BaseModel):
+    goal: str = Field(min_length=1, max_length=8000)
+    image_path: str | None = None
+    auto_execute: bool = False
+
+
+class DesktopRuntimeRecommendedAction(BaseModel):
+    kind: ControlActionType
+    text: str | None = None
+    why: str | None = None
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+class DesktopRuntimeObservation(BaseModel):
+    image_path: str | None = None
+    summary: str = ""
+    provider: ProviderType | None = None
+    model: str | None = None
+    vision_used: bool = False
+    attachment_count: int = 0
+    raw_model_output: str = ""
+
+
+class DesktopRuntimeStepResponse(BaseModel):
+    ok: bool
+    message: str
+    observation: DesktopRuntimeObservation
+    recommended_action: DesktopRuntimeRecommendedAction | None = None
+    executed: bool = False
+    action_result: ControlActionResult | None = None
+
+
 class ProviderHealthResponse(BaseModel):
     provider: ProviderType
     base_url: str

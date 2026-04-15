@@ -4,7 +4,6 @@ from fastapi import APIRouter, HTTPException
 
 from agent_studio.core.config import AppConfig
 from agent_studio.core.models import (
-    AgentModelAssignment,
     AppSettingsUpdateRequest,
     AutomationSettingsPayload,
     ChatImageAttachment,
@@ -15,9 +14,11 @@ from agent_studio.core.models import (
     ControlActionPayload,
     ControlActionResult,
     CreateConversationRequest,
-    DeleteConversationResponse,
     CreateTaskAgentRequest,
     CreateWorkflowTaskRequest,
+    DeleteConversationResponse,
+    DesktopRuntimeStepRequest,
+    DesktopRuntimeStepResponse,
     ElementLookupRequest,
     ElementLookupResponse,
     HealthResponse,
@@ -26,8 +27,8 @@ from agent_studio.core.models import (
     ProviderCapabilitiesResponse,
     ProviderHealthResponse,
     ProviderHealthSweepResponse,
-    ProviderSettingsPayload,
     ProviderType,
+    ProviderSettingsPayload,
     ScriptExecutionPrepareRequest,
     ScriptExecutionPreviewResponse,
     ScriptExecutionResponse,
@@ -36,19 +37,18 @@ from agent_studio.core.models import (
     SettingsSnapshot,
     SystemInfoResponse,
     UiStatePayload,
-    WorkflowApprovalDecisionRequest,
     WorkflowAgentTreeResponse,
+    WorkflowApprovalDecisionRequest,
     WorkflowRunResponse,
-    WorkflowStepDefinition,
-    WorkflowStepType,
     WorkflowTaskDetail,
     WorkflowTaskDetailListResponse,
     WorkflowTaskListResponse,
 )
 from agent_studio.core.state import SharedState
 from agent_studio.services.automation.input_controller import InputController
-from agent_studio.services.conversation_service import ConversationService
 from agent_studio.services.automation.permission_manager import PermissionManager
+from agent_studio.services.conversation_service import ConversationService
+from agent_studio.services.desktop import DesktopAgentRuntime
 from agent_studio.services.model_router import ModelRouter
 from agent_studio.services.perception.perception_service import PerceptionService
 from agent_studio.services.system.system_service import SystemService
@@ -63,6 +63,7 @@ def build_router(
     input_controller: InputController,
     conversation_service: ConversationService | None,
     perception_service: PerceptionService | None,
+    desktop_runtime: DesktopAgentRuntime | None = None,
     workflow_service: WorkflowService | None = None,
     system_service: SystemService | None = None,
 ) -> APIRouter:
@@ -245,6 +246,37 @@ def build_router(
         )
         return result
 
+    @router.post("/agent/runtime/step", response_model=DesktopRuntimeStepResponse)
+    async def runtime_step(
+        payload: DesktopRuntimeStepRequest,
+    ) -> DesktopRuntimeStepResponse:
+        _require_desktop_runtime(desktop_runtime)
+        try:
+            result = await desktop_runtime.step(
+                goal=payload.goal,
+                image_path=payload.image_path,
+                auto_execute=payload.auto_execute,
+            )
+        except ValueError as exc:
+            state.append_event(f"Desktop runtime request rejected: {exc}")
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            state.append_event(f"Desktop runtime step failed: {exc}")
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        observation_path = result.observation.image_path
+        if observation_path:
+            state.update_ui_state(UiStatePayload(latest_capture_path=observation_path))
+        action_label = (
+            result.recommended_action.kind.value
+            if result.recommended_action is not None
+            else "none"
+        )
+        state.append_event(
+            f"Desktop runtime step completed for goal '{payload.goal[:80]}' with action {action_label}."
+        )
+        return result
+
     @router.get("/conversations", response_model=ConversationListResponse)
     async def list_conversations() -> ConversationListResponse:
         _require_conversation_service(conversation_service)
@@ -326,9 +358,11 @@ def build_router(
                     UiStatePayload(current_conversation_id=conversation_id)
                 )
                 try:
-                    request_attachments = conversation_service.materialize_attachments_for_conversation(
-                        conversation_id=conversation_id,
-                        attachments=payload.attachments,
+                    request_attachments = (
+                        conversation_service.materialize_attachments_for_conversation(
+                            conversation_id=conversation_id,
+                            attachments=payload.attachments,
+                        )
                     )
                 except ValueError as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -336,121 +370,56 @@ def build_router(
             if latest_image_path:
                 state.update_ui_state(UiStatePayload(latest_capture_path=latest_image_path))
             request_payload = payload.model_copy(update={"attachments": request_attachments})
-            user_message = None
             if conversation_service is not None and conversation_id is not None:
-                user_message = conversation_service.append_message(
+                conversation_service.append_message(
                     conversation_id=conversation_id,
                     role="user",
                     content=payload.message,
                     attachments=_attachments_for_storage(request_attachments),
                 )
-            task: WorkflowTaskDetail | None = None
-            primary_failure_reason: str | None = None
-            provider_settings = state.get_provider_settings()
 
-            if workflow_service is not None and conversation_id is not None:
+            if desktop_runtime is not None and request_payload.attachments:
                 try:
-                    seeded_steps = _desktop_folder_seed_steps(payload.message)
-                    task_request = CreateWorkflowTaskRequest(
-                        title=None,
-                        conversation_id=conversation_id,
-                        instruction=seed_text,
-                        source_message_id=user_message.message_id if user_message is not None else None,
-                        source_message_preview=seed_text,
-                        model_assignment=_assignment_from_provider_settings(provider_settings),
-                        autonomous=not seeded_steps,
-                        max_iterations=8,
-                        preferred_language="system",
-                        steps=seeded_steps,
+                    runtime_response = await desktop_runtime.step(
+                        goal=seed_text,
+                        image_path=_latest_attachment_path(request_attachments),
+                        auto_execute=False,
                     )
-                    task = workflow_service.create_task(task_request)
-                    if conversation_service is not None and user_message is not None:
-                        conversation_service.link_message_to_task(
-                            message_id=user_message.message_id,
-                            task_id=task.task_id,
-                        )
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
                 except Exception as exc:
-                    primary_failure_reason = f"autonomous task creation failed: {exc}"
+                    state.append_event(f"Chat desktop runtime route failed: {exc}")
                 else:
-                    try:
-                        task = (await workflow_service.run_task(task.task_id)).task
-                    except Exception as exc:
-                        primary_failure_reason = f"autonomous task execution failed: {exc}"
-                        refreshed_task = await _try_reload_task(
-                            workflow_service=workflow_service,
-                            task_id=task.task_id,
-                        )
-                        if refreshed_task is not None:
-                            task = refreshed_task
-                    else:
-                        task_response = _build_chat_task_response(
-                            payload=request_payload,
+                    response = _build_chat_response_from_runtime(
+                        runtime_response=runtime_response,
+                        conversation_id=conversation_id,
+                        attachment_count=len(request_payload.attachments),
+                    )
+                    if conversation_service is not None and conversation_id is not None:
+                        conversation_service.append_message(
                             conversation_id=conversation_id,
-                            task=task,
-                            config=config,
+                            role="assistant",
+                            content=response.content,
                         )
-                        should_fallback, fallback_reason = _should_fallback_to_direct_chat(
-                            task=task,
-                            content=task_response.content,
-                        )
-                        if not should_fallback:
-                            if conversation_service is not None:
-                                conversation_service.append_message(
-                                    conversation_id=conversation_id,
-                                    role="assistant",
-                                    content=task_response.content,
-                                    linked_task_id=task.task_id,
-                                )
-                            route_label = (
-                                "seeded desktop-folder template"
-                                if seeded_steps
-                                else "autonomous planner"
-                            )
-                            state.append_event(
-                                "Chat created autonomous task "
-                                f"{task.task_id} for conversation {conversation_id} using "
-                                f"{provider_settings.provider.value}/{provider_settings.model} "
-                                f"via {route_label}."
-                            )
-                            return task_response
-                        primary_failure_reason = (
-                            fallback_reason
-                            or "autonomous task returned a low-signal response."
-                        )
-
-            if primary_failure_reason is not None:
-                state.append_event(
-                    f"Chat autonomous route fallback reason: {primary_failure_reason}"
-                )
-                state.append_event("Chat switched to direct model fallback response.")
+                    state.append_event(
+                        "Chat used desktop runtime for screenshot-driven reasoning."
+                    )
+                    return response
 
             try:
                 response = await model_router.chat(
                     request_payload.model_copy(update={"conversation_id": conversation_id})
                 )
             except Exception as exc:
-                if primary_failure_reason is not None:
-                    detail = (
-                        "Chat primary failure: "
-                        f"{primary_failure_reason}; fallback failure: {exc}"
-                    )
-                else:
-                    detail = f"Direct chat failed: {exc}"
+                detail = f"Direct chat failed: {exc}"
                 state.append_event(f"Chat request failed: {detail}")
                 raise HTTPException(status_code=502, detail=detail) from exc
-
-            response = _merge_chat_response_with_task(
-                response=response,
-                conversation_id=conversation_id,
-                task=task,
-            )
 
             if conversation_service is not None and conversation_id is not None:
                 conversation_service.append_message(
                     conversation_id=conversation_id,
                     role="assistant",
                     content=response.content,
-                    linked_task_id=task.task_id if task is not None else None,
                 )
             if response.fallback_used:
                 attempted = " -> ".join(
@@ -464,7 +433,7 @@ def build_router(
                     f"Chat response generated by {response.provider.value}"
                     f" with {response.attachment_count} image attachment(s)."
                 )
-            return response
+            return response.model_copy(update={"conversation_id": conversation_id})
         except HTTPException:
             raise
         except Exception as exc:  # pragma: no cover - surfaced to UI
@@ -579,6 +548,14 @@ def _require_workflow_service(workflow_service: WorkflowService | None) -> None:
         )
 
 
+def _require_desktop_runtime(desktop_runtime: DesktopAgentRuntime | None) -> None:
+    if desktop_runtime is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Desktop runtime services are unavailable in this runtime.",
+        )
+
+
 def _require_system_service(system_service: SystemService | None) -> None:
     if system_service is None:
         raise HTTPException(
@@ -636,272 +613,35 @@ def _latest_attachment_path(attachments: list[ChatImageAttachment]) -> str | Non
     return None
 
 
-def _build_chat_task_response(
+def _build_chat_response_from_runtime(
     *,
-    payload: ChatRequest,
-    conversation_id: str,
-    task: WorkflowTaskDetail,
-    config: AppConfig,
+    runtime_response: DesktopRuntimeStepResponse,
+    conversation_id: str | None,
+    attachment_count: int,
 ) -> ChatResponse:
-    root_agent = next(
-        (agent for agent in task.agents if agent.parent_agent_id is None),
-        task.agents[0] if task.agents else None,
-    )
-    assignment = root_agent.model_assignment if root_agent is not None else None
-    provider = (
-        assignment.provider
-        if assignment is not None and assignment.provider is not None
-        else ProviderType.OLLAMA
-    )
-    model = (
-        assignment.model
-        if assignment is not None and assignment.model
-        else config.default_local_model
-    )
-
-    status_value = task.status.value
-    content = (task.last_message or "").strip()
-    generic_messages = {
-        "Task is running.",
-        "Task created and ready to run.",
-    }
-    if status_value in {"completed", "failed", "waiting_approval"} and content in generic_messages:
-        content = ""
-    if content and _is_control_only_message(content):
-        content = ""
-    if task.pending_approval:
-        summary = str(task.pending_approval.get("summary") or content).strip()
-        warnings = task.pending_approval.get("warnings") or []
-        lines = [summary or "The task is waiting for approval."]
-        if warnings:
-            lines.append("")
-            lines.extend(f"- {warning}" for warning in warnings[:4])
-        content = "\n".join(lines)
-    elif not content:
-        content = _pick_useful_result_message(task)
-    if not content:
-        fallback_messages = {
-            "completed": f"Task '{task.title}' completed.",
-            "waiting_approval": f"Task '{task.title}' is waiting for approval.",
-            "failed": f"Task '{task.title}' failed.",
-        }
-        content = fallback_messages.get(status_value, f"Task '{task.title}' is running.")
-    task_vision_used, task_attachment_count = _task_vision_usage(task)
+    observation = runtime_response.observation
+    provider = observation.provider or ProviderType.MOCK
+    model = observation.model or "runtime"
+    content = (observation.summary or runtime_response.message).strip()
+    recommended_action = runtime_response.recommended_action
+    if recommended_action is not None:
+        action_text = recommended_action.kind.value
+        if recommended_action.text:
+            action_text = f"{action_text} ({recommended_action.text})"
+        if recommended_action.why:
+            action_text = f"{action_text}: {recommended_action.why}"
+        if content:
+            content = f"{content}\n\nRecommended next action: {action_text}"
+        else:
+            content = f"Recommended next action: {action_text}"
 
     return ChatResponse(
         provider=provider,
         model=model,
         content=content,
         conversation_id=conversation_id,
-        task_id=task.task_id,
-        task_status=status_value,
-        task_title=task.title,
         used_mock=provider == ProviderType.MOCK,
-        vision_used=bool(payload.attachments) or task_vision_used,
-        attachment_count=max(len(payload.attachments), task_attachment_count),
+        vision_used=observation.vision_used or attachment_count > 0,
+        attachment_count=max(attachment_count, observation.attachment_count),
         latency_ms=0,
     )
-
-
-def _assignment_from_provider_settings(
-    provider_settings: ProviderSettingsPayload,
-) -> AgentModelAssignment:
-    return AgentModelAssignment(
-        provider=provider_settings.provider,
-        model=provider_settings.model,
-        base_url=provider_settings.base_url,
-        assignment_reason=(
-            "Chat tasks inherit the current provider settings so the conversation route "
-            "stays aligned with the active model configuration."
-        ),
-    )
-
-
-def _should_fallback_to_direct_chat(
-    *,
-    task: WorkflowTaskDetail,
-    content: str,
-) -> tuple[bool, str | None]:
-    status_value = task.status.value
-    if status_value == "failed":
-        return True, "autonomous task ended with status failed"
-
-    normalized_content = content.strip()
-    if not normalized_content:
-        return True, "autonomous task returned empty content"
-
-    if _is_task_status_placeholder(normalized_content):
-        return True, "autonomous task returned a placeholder status message"
-
-    lowered_content = normalized_content.lower()
-    low_signal_markers = (
-        "autonomous planning failed",
-        "planner did not return valid json",
-        "autonomous planning reached the maximum number of iterations",
-        "task is running.",
-        "task created and ready to run.",
-    )
-    for marker in low_signal_markers:
-        if marker in lowered_content:
-            return True, f"autonomous task returned low-signal content: {marker}"
-    return False, None
-
-
-def _is_task_status_placeholder(content: str) -> bool:
-    lowered = content.strip().lower()
-    return lowered.startswith("task '") and (
-        lowered.endswith("' completed.")
-        or lowered.endswith("' failed.")
-        or lowered.endswith("' is waiting for approval.")
-        or lowered.endswith("' is running.")
-    )
-
-
-def _merge_chat_response_with_task(
-    *,
-    response: ChatResponse,
-    conversation_id: str | None,
-    task: WorkflowTaskDetail | None,
-) -> ChatResponse:
-    updates: dict[str, object | None] = {"conversation_id": conversation_id}
-    if task is not None:
-        task_vision_used, task_attachment_count = _task_vision_usage(task)
-        updates.update(
-            {
-                "task_id": task.task_id,
-                "task_status": task.status.value,
-                "task_title": task.title,
-                "vision_used": response.vision_used or task_vision_used,
-                "attachment_count": max(response.attachment_count, task_attachment_count),
-            }
-        )
-    return response.model_copy(update=updates)
-
-
-async def _try_reload_task(
-    *,
-    workflow_service: WorkflowService,
-    task_id: str,
-) -> WorkflowTaskDetail | None:
-    try:
-        return await workflow_service.get_task(task_id)
-    except Exception:
-        return None
-
-
-def _pick_useful_result_message(task: WorkflowTaskDetail) -> str:
-    for result in reversed(task.results):
-        message = result.message.strip()
-        if not message:
-            continue
-        if result.kind in {
-            WorkflowStepType.MOVE_MOUSE,
-            WorkflowStepType.LEFT_CLICK,
-            WorkflowStepType.TYPE_TEXT,
-        }:
-            continue
-        return message
-    for result in reversed(task.results):
-        message = result.message.strip()
-        if message:
-            return message
-    return ""
-
-
-def _task_vision_usage(task: WorkflowTaskDetail) -> tuple[bool, int]:
-    used = False
-    attachment_count = 0
-    for result in task.results:
-        if result.kind != WorkflowStepType.ANALYZE_IMAGE:
-            continue
-        used = True
-        output = result.output or {}
-        if isinstance(output, dict):
-            raw = output.get("attachment_count")
-            if isinstance(raw, int) and raw > 0:
-                attachment_count += raw
-                continue
-        attachment_count += 1
-    return used, attachment_count
-
-
-def _is_control_only_message(content: str) -> bool:
-    lowered = content.strip().lower()
-    return (
-        lowered.startswith("mouse moved to ")
-        or lowered == "left click executed."
-        or lowered.startswith("typed ")
-        or "this platform is using the noop controller" in lowered
-    )
-
-
-def _desktop_folder_seed_steps(message: str) -> list[WorkflowStepDefinition]:
-    normalized = " ".join((message or "").strip().lower().split())
-    if not normalized:
-        return []
-    zh_scope_match = "桌面" in normalized or "图标" in normalized
-    zh_target_match = "文件夹" in normalized and "左上角" in normalized
-    zh_intent_match = any(
-        keyword in normalized for keyword in ("叫什么", "名称", "名字", "打开", "双击", "关闭")
-    )
-    zh_match = zh_scope_match and zh_target_match and zh_intent_match
-    en_match = (
-        "desktop" in normalized
-        and "folder" in normalized
-        and ("top-left" in normalized or "top left" in normalized)
-        and any(keyword in normalized for keyword in ("name", "open", "double click", "close"))
-    )
-    if not (zh_match or en_match):
-        return []
-    open_match = any(
-        keyword in normalized for keyword in ("打开", "双击", "open", "double click")
-    )
-    close_match = "关闭" in normalized or "close" in normalized
-    needs_open = open_match or close_match
-    steps: list[WorkflowStepDefinition] = [
-        WorkflowStepDefinition(
-            kind=WorkflowStepType.CAPTURE_SCREEN,
-            label="Capture Desktop",
-        ),
-        WorkflowStepDefinition(
-            kind=WorkflowStepType.ANALYZE_IMAGE,
-            label="Analyze Desktop Folders",
-            text=(
-                "Count visible desktop folders, identify the first folder in the top-left area, "
-                "and answer in concise Chinese with folder count and folder name."
-            ),
-        ),
-    ]
-    if needs_open:
-        steps.extend(
-            [
-                WorkflowStepDefinition(
-                    kind=WorkflowStepType.MOVE_MOUSE,
-                    label="Move To Top-Left Folder",
-                    text="80,80",
-                ),
-                WorkflowStepDefinition(
-                    kind=WorkflowStepType.LEFT_CLICK,
-                    label="Open Folder Click 1",
-                ),
-                WorkflowStepDefinition(
-                    kind=WorkflowStepType.LEFT_CLICK,
-                    label="Open Folder Click 2",
-                ),
-            ]
-        )
-    if close_match:
-        steps.extend(
-            [
-                WorkflowStepDefinition(
-                    kind=WorkflowStepType.MOVE_MOUSE,
-                    label="Move To Close Button",
-                    text="1910,12",
-                ),
-                WorkflowStepDefinition(
-                    kind=WorkflowStepType.LEFT_CLICK,
-                    label="Close Window Click",
-                ),
-            ]
-        )
-    return steps
