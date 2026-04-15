@@ -110,6 +110,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._active_settings_dialog: SettingsDialog | None = None
         self._pending_approval: dict | None = None
         self._chat_in_flight = False
+        self._runtime_in_flight = False
+        self._runtime_log_entries: list[str] = []
+        self._last_runtime_step_payload: dict | None = None
         self._suppress_conversation_selection = False
 
         self.resize(1440, 940)
@@ -217,13 +220,79 @@ class MainWindow(QtWidgets.QMainWindow):
         root.addWidget(self.runtime_group)
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self._build_runtime_workspace_panel())
         splitter.addWidget(self._build_chat_panel())
         splitter.addWidget(self._build_activity_panel())
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 3)
+        splitter.setStretchFactor(2, 2)
         root.addWidget(splitter, stretch=1)
 
         self.statusBar().showMessage(self._t("status_ready"))
+
+    def _build_runtime_workspace_panel(self) -> QtWidgets.QGroupBox:
+        self.runtime_workspace_group = QtWidgets.QGroupBox()
+        layout = QtWidgets.QVBoxLayout(self.runtime_workspace_group)
+        layout.setSpacing(10)
+
+        self.runtime_workspace_hint_label = QtWidgets.QLabel()
+        self.runtime_workspace_hint_label.setProperty("muted", True)
+        self.runtime_workspace_hint_label.setWordWrap(True)
+        layout.addWidget(self.runtime_workspace_hint_label)
+
+        self.runtime_goal_input = QtWidgets.QPlainTextEdit()
+        self.runtime_goal_input.setFixedHeight(100)
+        layout.addWidget(self.runtime_goal_input)
+
+        button_row = QtWidgets.QHBoxLayout()
+        self.runtime_capture_button = QtWidgets.QPushButton()
+        self.runtime_step_button = QtWidgets.QPushButton()
+        self.runtime_execute_button = QtWidgets.QPushButton()
+        button_row.addWidget(self.runtime_capture_button)
+        button_row.addWidget(self.runtime_step_button)
+        button_row.addWidget(self.runtime_execute_button)
+        layout.addLayout(button_row)
+
+        self.runtime_preview_group = QtWidgets.QGroupBox()
+        preview_layout = QtWidgets.QVBoxLayout(self.runtime_preview_group)
+        preview_layout.setSpacing(8)
+        self.runtime_preview_meta_label = QtWidgets.QLabel()
+        self.runtime_preview_meta_label.setProperty("muted", True)
+        self.runtime_preview_meta_label.setWordWrap(True)
+        self.runtime_preview_view = QtWidgets.QTextBrowser()
+        self.runtime_preview_view.setOpenExternalLinks(False)
+        self.runtime_preview_view.setMinimumHeight(240)
+        preview_layout.addWidget(self.runtime_preview_meta_label)
+        preview_layout.addWidget(self.runtime_preview_view)
+        layout.addWidget(self.runtime_preview_group)
+
+        self.runtime_action_group = QtWidgets.QGroupBox()
+        action_layout = QtWidgets.QVBoxLayout(self.runtime_action_group)
+        self.runtime_action_view = QtWidgets.QTextBrowser()
+        self.runtime_action_view.setMinimumHeight(140)
+        action_layout.addWidget(self.runtime_action_view)
+        layout.addWidget(self.runtime_action_group)
+
+        self.runtime_observation_group = QtWidgets.QGroupBox()
+        observation_layout = QtWidgets.QVBoxLayout(self.runtime_observation_group)
+        self.runtime_observation_view = QtWidgets.QTextBrowser()
+        self.runtime_observation_view.setMinimumHeight(180)
+        observation_layout.addWidget(self.runtime_observation_view)
+        layout.addWidget(self.runtime_observation_group)
+
+        self.runtime_log_group = QtWidgets.QGroupBox()
+        log_layout = QtWidgets.QVBoxLayout(self.runtime_log_group)
+        self.runtime_log_view = QtWidgets.QTextBrowser()
+        self.runtime_log_view.setMinimumHeight(150)
+        log_layout.addWidget(self.runtime_log_view)
+        layout.addWidget(self.runtime_log_group, stretch=1)
+
+        self._render_runtime_preview(self.latest_capture_path)
+        self._render_runtime_action(None)
+        self._render_runtime_observation(None)
+        self._render_runtime_log()
+        return self.runtime_workspace_group
 
     def _build_chat_panel(self) -> QtWidgets.QGroupBox:
         self.chat_group = QtWidgets.QGroupBox()
@@ -340,13 +409,78 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.events_group)
         return self.activity_group
 
+    def _set_runtime_busy(self, busy: bool) -> None:
+        self._runtime_in_flight = busy
+        self.runtime_goal_input.setEnabled(not busy)
+        self.runtime_capture_button.setEnabled(not busy)
+        self.runtime_step_button.setEnabled(not busy)
+        self.runtime_execute_button.setEnabled(not busy)
+
+    def capture_runtime_screenshot(self) -> None:
+        if self._runtime_in_flight:
+            return
+        self._set_runtime_busy(True)
+        self._append_runtime_log(self._t("runtime_log_capture_requested"))
+        self.statusBar().showMessage(self._t("status_runtime_capture_started"), 3000)
+        self._queue_request(
+            "runtime:capture",
+            "/api/perception/capture",
+            method="POST",
+            timeout=max(self.config.request_timeout_seconds, 60.0),
+            on_success=self._on_runtime_capture_response,
+            on_failure=self._on_runtime_capture_failure,
+            error_context="Runtime capture failed",
+        )
+
+    def run_runtime_step(self, auto_execute: bool) -> None:
+        if self._runtime_in_flight:
+            return
+        goal = self.runtime_goal_input.toPlainText().strip()
+        if not goal:
+            self.statusBar().showMessage(self._t("status_runtime_goal_required"), 3000)
+            return
+        self._set_runtime_busy(True)
+        self._append_runtime_log(
+            self._t(
+                "runtime_log_execute_requested"
+                if auto_execute
+                else "runtime_log_step_requested"
+            )
+        )
+        self.statusBar().showMessage(
+            self._t(
+                "status_runtime_execute_started"
+                if auto_execute
+                else "status_runtime_step_started"
+            ),
+            3000,
+        )
+        self._queue_request(
+            "runtime:step",
+            "/api/agent/runtime/step",
+            method="POST",
+            payload={
+                "goal": goal,
+                "image_path": self.latest_capture_path,
+                "auto_execute": auto_execute,
+            },
+            timeout=max(self.config.request_timeout_seconds, 120.0),
+            on_success=self._on_runtime_step_response,
+            on_failure=self._on_runtime_step_failure,
+            error_context="Runtime step failed",
+        )
+
     def _wire_signals(self) -> None:
         self.chat_view.anchorClicked.connect(self._on_browser_link_clicked)
+        self.runtime_preview_view.anchorClicked.connect(self._on_browser_link_clicked)
         self.settings_button.clicked.connect(self.open_settings_dialog)
         self.refresh_button.clicked.connect(self.refresh_all)
         self.new_conversation_button.clicked.connect(self.create_conversation)
         self.delete_conversation_button.clicked.connect(self.delete_current_conversation)
         self.reload_conversations_button.clicked.connect(self.refresh_all)
+        self.runtime_capture_button.clicked.connect(self.capture_runtime_screenshot)
+        self.runtime_step_button.clicked.connect(lambda: self.run_runtime_step(False))
+        self.runtime_execute_button.clicked.connect(lambda: self.run_runtime_step(True))
         self.conversation_list.currentItemChanged.connect(self._on_conversation_selected)
         self.attach_images_button.clicked.connect(self.choose_chat_attachments)
         self.clear_images_button.clicked.connect(self.clear_chat_attachments)
@@ -379,6 +513,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.provider_runtime_label.setText(self._t("provider"))
         self.mode_runtime_label.setText(self._t("control_mode"))
         self.controller_runtime_label.setText(self._t("controller"))
+        self.runtime_workspace_group.setTitle(self._t("runtime_workspace"))
+        self.runtime_workspace_hint_label.setText(self._t("runtime_workspace_hint"))
+        self.runtime_goal_input.setPlaceholderText(self._t("runtime_goal_placeholder"))
+        self.runtime_capture_button.setText(self._t("runtime_capture"))
+        self.runtime_step_button.setText(self._t("runtime_step"))
+        self.runtime_execute_button.setText(self._t("runtime_step_execute"))
+        self.runtime_preview_group.setTitle(self._t("runtime_preview"))
+        self.runtime_action_group.setTitle(self._t("runtime_recommended_action"))
+        self.runtime_observation_group.setTitle(self._t("runtime_observation"))
+        self.runtime_log_group.setTitle(self._t("runtime_log"))
         self.chat_group.setTitle(self._t("conversation"))
         self.new_conversation_button.setText(self._t("new_conversation"))
         self.delete_conversation_button.setText(self._t("delete_conversation"))
@@ -398,6 +542,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.approval_deny_button.setText(self._t("approval_deny"))
         self.approval_prompt_button.setText(self._t("approval_prompt"))
         self.events_group.setTitle(self._t("events"))
+        self._render_runtime_preview(self.latest_capture_path)
+        self._render_runtime_action(self._last_runtime_step_payload)
+        self._render_runtime_observation(self._last_runtime_step_payload)
+        self._render_runtime_log()
         self._update_chat_attachment_status()
         self._update_conversation_banner()
         self._render_events(self._last_settings_payload.get("recent_events", []))
@@ -578,10 +726,78 @@ class MainWindow(QtWidgets.QMainWindow):
             self._active_settings_dialog.set_snapshot(payload)
 
         self._apply_language()
+        self._render_runtime_preview(self.latest_capture_path)
         if self.current_conversation_id:
             self._select_conversation_in_list(self.current_conversation_id)
             if self.loaded_conversation_id != self.current_conversation_id:
                 self.refresh_current_conversation()
+
+    def _on_runtime_capture_response(self, payload: dict) -> None:
+        self._set_runtime_busy(False)
+        if payload.get("ok") and payload.get("image_path"):
+            image_path = str(payload["image_path"])
+            self.latest_capture_path = image_path
+            self._render_runtime_preview(image_path)
+            self.refresh_settings()
+            self._append_runtime_log(
+                self._t("runtime_log_capture_ready", path=Path(image_path).name)
+            )
+            self.statusBar().showMessage(self._t("status_runtime_capture_ready"), 4000)
+            return
+        message = str(payload.get("message") or self._t("runtime_preview_empty"))
+        self._append_runtime_log(message)
+        self.statusBar().showMessage(message, 5000)
+
+    def _on_runtime_capture_failure(self, error: str) -> None:
+        self._set_runtime_busy(False)
+        self._append_runtime_log(
+            self._t("runtime_log_capture_failed", error=error)
+        )
+        self._show_request_error("Runtime capture failed", error)
+
+    def _on_runtime_step_response(self, payload: dict) -> None:
+        self._set_runtime_busy(False)
+        self._last_runtime_step_payload = payload
+
+        observation = payload.get("observation") if isinstance(payload, dict) else None
+        image_path = (
+            str(observation.get("image_path")).strip()
+            if isinstance(observation, dict) and observation.get("image_path")
+            else ""
+        )
+        if image_path:
+            self.latest_capture_path = image_path
+            self.refresh_settings()
+
+        self._render_runtime_preview(self.latest_capture_path)
+        self._render_runtime_action(payload)
+        self._render_runtime_observation(payload)
+
+        result_message = str(payload.get("message") or "").strip()
+        action = payload.get("recommended_action") if isinstance(payload, dict) else None
+        action_result = payload.get("action_result") if isinstance(payload, dict) else None
+        executed = bool(payload.get("executed")) if isinstance(payload, dict) else False
+        if result_message:
+            self._append_runtime_log(result_message)
+        if isinstance(action, dict) and action.get("kind"):
+            self._append_runtime_log(
+                self._t("runtime_log_action_recommended", action=str(action.get("kind")))
+            )
+        else:
+            self._append_runtime_log(self._t("runtime_log_action_none"))
+        if isinstance(action_result, dict) and action_result.get("message"):
+            self._append_runtime_log(str(action_result.get("message")))
+
+        status_key = "status_runtime_execute_ready" if executed else "status_runtime_step_ready"
+        if not payload.get("ok", True):
+            self.statusBar().showMessage(result_message or self._t(status_key), 5000)
+            return
+        self.statusBar().showMessage(self._t(status_key), 5000)
+
+    def _on_runtime_step_failure(self, error: str) -> None:
+        self._set_runtime_busy(False)
+        self._append_runtime_log(self._t("runtime_log_step_failed", error=error))
+        self._show_request_error("Runtime step failed", error)
 
     def _apply_conversation_list(self, payload: dict) -> None:
         conversations = payload.get("conversations", [])
@@ -965,6 +1181,136 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         lines = "<br>".join(escape(item) for item in events)
         self.events_view.setHtml(self._wrap_html_body(f"<p>{lines}</p>"))
+
+    def _render_runtime_preview(self, image_path: str | None) -> None:
+        normalized_path = str(image_path or "").strip()
+        if not normalized_path:
+            self.runtime_preview_meta_label.setText(self._t("runtime_preview_empty"))
+            self.runtime_preview_view.setHtml(
+                self._wrap_html_body(f"<p>{escape(self._t('runtime_preview_empty'))}</p>")
+            )
+            return
+
+        resolved_path: Path | None = None
+        try:
+            candidate = Path(normalized_path).expanduser()
+            resolved_path = candidate.resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            resolved_path = None
+
+        display_path = str(resolved_path or normalized_path)
+        self.runtime_preview_meta_label.setText(display_path)
+
+        if resolved_path is not None and resolved_path.exists():
+            uri = resolved_path.as_uri()
+            preview_html = (
+                f"<p><a href='{escape(uri)}'>{escape(resolved_path.name)}</a></p>"
+                f"<img src='{escape(uri)}' style='max-width:100%;border:1px solid #d8deea;"
+                "border-radius:10px;'>"
+            )
+        else:
+            preview_html = (
+                f"<p>{escape(self._t('runtime_preview_missing', path=display_path))}</p>"
+            )
+        self.runtime_preview_view.setHtml(self._wrap_html_body(preview_html))
+
+    def _render_runtime_action(self, payload: dict | None) -> None:
+        action = payload.get("recommended_action") if isinstance(payload, dict) else None
+        action_result = payload.get("action_result") if isinstance(payload, dict) else None
+        executed = bool(payload.get("executed")) if isinstance(payload, dict) else False
+        if not isinstance(action, dict) or not action.get("kind"):
+            self.runtime_action_view.setHtml(
+                self._wrap_html_body(f"<p>{escape(self._t('runtime_action_empty'))}</p>")
+            )
+            return
+
+        try:
+            confidence_value = float(action.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence_value = 0.0
+
+        rows = [
+            (
+                self._t("runtime_action_kind"),
+                str(action.get("kind", self._t("label_none"))),
+            ),
+            (
+                self._t("runtime_action_text"),
+                str(action.get("text") or self._t("label_none")),
+            ),
+            (
+                self._t("runtime_action_reason"),
+                str(action.get("why") or self._t("label_none")),
+            ),
+            (
+                self._t("runtime_action_confidence"),
+                f"{confidence_value:.0%}",
+            ),
+            (
+                self._t("runtime_action_executed"),
+                self._bool_label(executed),
+            ),
+        ]
+        if isinstance(action_result, dict):
+            rows.append(
+                (
+                    self._t("runtime_action_result"),
+                    str(action_result.get("message") or self._t("label_none")),
+                )
+            )
+
+        table_rows = "".join(
+            f"<tr><td><b>{escape(label)}</b></td><td>{escape(value)}</td></tr>"
+            for label, value in rows
+        )
+        self.runtime_action_view.setHtml(self._wrap_html_body(f"<table>{table_rows}</table>"))
+
+    def _render_runtime_observation(self, payload: dict | None) -> None:
+        observation = payload.get("observation") if isinstance(payload, dict) else None
+        if not isinstance(observation, dict):
+            self.runtime_observation_view.setHtml(
+                self._wrap_html_body(f"<p>{escape(self._t('runtime_observation_empty'))}</p>")
+            )
+            return
+
+        message = str(payload.get("message") or self._t("label_none"))
+        summary = str(observation.get("summary") or self._t("label_none"))
+        provider = str(observation.get("provider") or self._t("label_none"))
+        model = str(observation.get("model") or self._t("label_none"))
+        image_path = str(observation.get("image_path") or self._t("label_none"))
+        vision_used = self._bool_label(bool(observation.get("vision_used", False)))
+        attachment_count = str(observation.get("attachment_count", 0))
+
+        html = [
+            f"<p><b>{escape(self._t('runtime_result_message'))}</b>: {escape(message)}</p>",
+            f"<p><b>{escape(self._t('runtime_observation_summary'))}</b></p>",
+            f"<p>{escape(summary).replace(chr(10), '<br>')}</p>",
+            "<table>",
+            f"<tr><td><b>{escape(self._t('runtime_image_path'))}</b></td><td>{escape(image_path)}</td></tr>",
+            f"<tr><td><b>{escape(self._t('runtime_provider_model'))}</b></td><td>{escape(provider)} / {escape(model)}</td></tr>",
+            f"<tr><td><b>{escape(self._t('runtime_vision_used'))}</b></td><td>{escape(vision_used)}</td></tr>",
+            f"<tr><td><b>{escape(self._t('runtime_attachment_count'))}</b></td><td>{escape(attachment_count)}</td></tr>",
+            "</table>",
+        ]
+        self.runtime_observation_view.setHtml(self._wrap_html_body("".join(html)))
+
+    def _append_runtime_log(self, message: str) -> None:
+        entry = message.strip()
+        if not entry:
+            return
+        timestamp = QtCore.QDateTime.currentDateTime().toString("HH:mm:ss")
+        self._runtime_log_entries.append(f"[{timestamp}] {entry}")
+        self._runtime_log_entries = self._runtime_log_entries[-18:]
+        self._render_runtime_log()
+
+    def _render_runtime_log(self) -> None:
+        if not self._runtime_log_entries:
+            self.runtime_log_view.setHtml(
+                self._wrap_html_body(f"<p>{escape(self._t('runtime_log_empty'))}</p>")
+            )
+            return
+        lines = "<br>".join(escape(item) for item in self._runtime_log_entries)
+        self.runtime_log_view.setHtml(self._wrap_html_body(f"<p>{lines}</p>"))
 
     def _render_empty_chat(self) -> None:
         self.chat_view.setHtml(self._wrap_html_body(f"<p>{escape(self._t('conversation_empty'))}</p>"))
