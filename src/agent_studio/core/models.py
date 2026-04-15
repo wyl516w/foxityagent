@@ -119,11 +119,26 @@ class DesktopRuntimeStepRequest(BaseModel):
     auto_execute: bool = False
 
 
+class DesktopRuntimeTargetPoint(BaseModel):
+    x: float
+    y: float
+
+
+class DesktopRuntimeTargetBBox(BaseModel):
+    x: float
+    y: float
+    width: float = Field(gt=0.0)
+    height: float = Field(gt=0.0)
+
+
 class DesktopRuntimeRecommendedAction(BaseModel):
     kind: ControlActionType
     text: str | None = None
     why: str | None = None
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    target_point: DesktopRuntimeTargetPoint | None = None
+    target_bbox: DesktopRuntimeTargetBBox | None = None
+    annotation_label: str | None = None
 
 
 class DesktopRuntimeObservation(BaseModel):

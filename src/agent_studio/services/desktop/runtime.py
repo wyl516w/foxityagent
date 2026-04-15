@@ -13,6 +13,8 @@ from agent_studio.core.models import (
     ControlActionType,
     DesktopRuntimeObservation,
     DesktopRuntimeRecommendedAction,
+    DesktopRuntimeTargetBBox,
+    DesktopRuntimeTargetPoint,
     DesktopRuntimeStepResponse,
     UiStatePayload,
 )
@@ -134,10 +136,12 @@ def _build_runtime_prompt(goal: str) -> str:
             (
                 'Use the shape '
                 '{"summary":"...","recommended_action":null} '
-                'or {"summary":"...","recommended_action":{"kind":"move_mouse","text":"640,360","why":"...","confidence":0.82}}.'
+                'or {"summary":"...","recommended_action":{"kind":"move_mouse","text":"640,360","why":"...","confidence":0.82,"'
+                'target_point":{"x":640,"y":360},"target_bbox":{"x":560,"y":320,"width":160,"height":80},"annotation_label":"..."}}.'
             ),
             "Allowed action kinds: move_mouse, left_click, type_text.",
             "Use text for coordinates or typed content when needed.",
+            "target_point, target_bbox, and annotation_label are optional but preferred when location is clear.",
             "If no safe and reliable next action is clear, set recommended_action to null.",
         ]
     )
@@ -173,12 +177,63 @@ def _parse_recommended_action(value: Any) -> DesktopRuntimeRecommendedAction | N
         confidence_value = float(confidence)
     except (TypeError, ValueError):
         confidence_value = 0.0
+
+    target_point = _parse_target_point(value.get("target_point"))
+    if target_point is None:
+        target_point = _parse_point_from_text(text)
+
+    target_bbox = _parse_target_bbox(value.get("target_bbox"))
+    annotation_label = value.get("annotation_label")
+
     return DesktopRuntimeRecommendedAction(
         kind=action_type,
         text=str(text).strip() if text is not None else None,
         why=str(why).strip() if why is not None else None,
         confidence=max(0.0, min(confidence_value, 1.0)),
+        target_point=target_point,
+        target_bbox=target_bbox,
+        annotation_label=str(annotation_label).strip() if annotation_label is not None else None,
     )
+
+
+def _parse_target_point(value: Any) -> DesktopRuntimeTargetPoint | None:
+    if not isinstance(value, dict):
+        return None
+    try:
+        x = float(value.get("x"))
+        y = float(value.get("y"))
+    except (TypeError, ValueError):
+        return None
+    return DesktopRuntimeTargetPoint(x=x, y=y)
+
+
+def _parse_target_bbox(value: Any) -> DesktopRuntimeTargetBBox | None:
+    if not isinstance(value, dict):
+        return None
+    try:
+        x = float(value.get("x"))
+        y = float(value.get("y"))
+        width = float(value.get("width"))
+        height = float(value.get("height"))
+    except (TypeError, ValueError):
+        return None
+    if width <= 0.0 or height <= 0.0:
+        return None
+    return DesktopRuntimeTargetBBox(x=x, y=y, width=width, height=height)
+
+
+def _parse_point_from_text(text: Any) -> DesktopRuntimeTargetPoint | None:
+    if not isinstance(text, str):
+        return None
+    parts = [segment.strip() for segment in text.split(",")]
+    if len(parts) != 2:
+        return None
+    try:
+        x = float(parts[0])
+        y = float(parts[1])
+    except ValueError:
+        return None
+    return DesktopRuntimeTargetPoint(x=x, y=y)
 
 
 def _extract_json_object(content: str) -> dict[str, Any] | None:
