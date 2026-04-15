@@ -30,7 +30,13 @@ _ALLOWED_ACTIONS = {
 
 
 class DesktopAgentRuntime:
-    """Direct desktop observation loop independent from workflow templates."""
+    """Conversation-independent desktop runtime foundation.
+
+    This runtime starts shifting the product away from a workflow shell and
+    toward a direct desktop-agent cycle:
+
+    observe -> interpret -> recommend one next action -> optionally execute.
+    """
 
     def __init__(
         self,
