@@ -326,7 +326,8 @@ def test_runtime_step_route_returns_observation_and_recommended_action() -> None
             responses=[
                 (
                     '{"summary":"The Settings button is visible.",'
-                    '"recommended_action":{"kind":"move_mouse","text":"40,50","why":"Position the cursor over Settings.","confidence":0.9}}'
+                    '"recommended_action":{"kind":"move_mouse","text":"40,50","why":"Position the cursor over Settings.","confidence":0.9,'
+                    '"target_bbox":{"x":10,"y":10,"width":100,"height":30},"annotation_label":"Settings button"}}'
                 )
             ]
         )
@@ -369,6 +370,14 @@ def test_runtime_step_route_returns_observation_and_recommended_action() -> None
         assert payload["recommended_action"]["kind"] == "move_mouse"
         assert payload["recommended_action"]["text"] == "40,50"
         assert payload["recommended_action"]["why"] == "Position the cursor over Settings."
+        assert payload["recommended_action"]["target_point"] == {"x": 40.0, "y": 50.0}
+        assert payload["recommended_action"]["target_bbox"] == {
+            "x": 10.0,
+            "y": 10.0,
+            "width": 100.0,
+            "height": 30.0,
+        }
+        assert payload["recommended_action"]["annotation_label"] == "Settings button"
         assert payload["executed"] is False
     finally:
         shutil.rmtree(test_dir, ignore_errors=True)

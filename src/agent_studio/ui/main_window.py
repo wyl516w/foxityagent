@@ -542,7 +542,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.approval_deny_button.setText(self._t("approval_deny"))
         self.approval_prompt_button.setText(self._t("approval_prompt"))
         self.events_group.setTitle(self._t("events"))
-        self._render_runtime_preview(self.latest_capture_path)
+        self._render_runtime_preview(self.latest_capture_path, self._last_runtime_step_payload)
         self._render_runtime_action(self._last_runtime_step_payload)
         self._render_runtime_observation(self._last_runtime_step_payload)
         self._render_runtime_log()
@@ -726,7 +726,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._active_settings_dialog.set_snapshot(payload)
 
         self._apply_language()
-        self._render_runtime_preview(self.latest_capture_path)
+        self._render_runtime_preview(self.latest_capture_path, self._last_runtime_step_payload)
         if self.current_conversation_id:
             self._select_conversation_in_list(self.current_conversation_id)
             if self.loaded_conversation_id != self.current_conversation_id:
@@ -737,7 +737,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if payload.get("ok") and payload.get("image_path"):
             image_path = str(payload["image_path"])
             self.latest_capture_path = image_path
-            self._render_runtime_preview(image_path)
+            self._last_runtime_step_payload = None
+            self._render_runtime_preview(image_path, None)
+            self._render_runtime_action(None)
+            self._render_runtime_observation(None)
             self.refresh_settings()
             self._append_runtime_log(
                 self._t("runtime_log_capture_ready", path=Path(image_path).name)
@@ -769,7 +772,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.latest_capture_path = image_path
             self.refresh_settings()
 
-        self._render_runtime_preview(self.latest_capture_path)
+        self._render_runtime_preview(self.latest_capture_path, payload)
         self._render_runtime_action(payload)
         self._render_runtime_observation(payload)
 
@@ -1182,7 +1185,7 @@ class MainWindow(QtWidgets.QMainWindow):
         lines = "<br>".join(escape(item) for item in events)
         self.events_view.setHtml(self._wrap_html_body(f"<p>{lines}</p>"))
 
-    def _render_runtime_preview(self, image_path: str | None) -> None:
+    def _render_runtime_preview(self, image_path: str | None, payload: dict | None = None) -> None:
         normalized_path = str(image_path or "").strip()
         if not normalized_path:
             self.runtime_preview_meta_label.setText(self._t("runtime_preview_empty"))
@@ -1203,16 +1206,158 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if resolved_path is not None and resolved_path.exists():
             uri = resolved_path.as_uri()
+            overlay_html = self._build_runtime_overlay_html(payload, resolved_path)
             preview_html = (
                 f"<p><a href='{escape(uri)}'>{escape(resolved_path.name)}</a></p>"
-                f"<img src='{escape(uri)}' style='max-width:100%;border:1px solid #d8deea;"
-                "border-radius:10px;'>"
+                "<div style='position:relative;display:inline-block;max-width:100%;'>"
+                f"<img src='{escape(uri)}' style='display:block;max-width:100%;border:1px solid #d8deea;border-radius:10px;'>"
+                f"{overlay_html}</div>"
             )
         else:
             preview_html = (
                 f"<p>{escape(self._t('runtime_preview_missing', path=display_path))}</p>"
             )
         self.runtime_preview_view.setHtml(self._wrap_html_body(preview_html))
+
+    def _build_runtime_overlay_html(self, payload: dict | None, image_path: Path) -> str:
+        action = payload.get("recommended_action") if isinstance(payload, dict) else None
+        if not isinstance(action, dict):
+            return ""
+
+        image_reader = QtGui.QImageReader(str(image_path))
+        image_size = image_reader.size()
+        if not image_size.isValid() or image_size.width() <= 0 or image_size.height() <= 0:
+            return ""
+
+        image_width = float(image_size.width())
+        image_height = float(image_size.height())
+
+        target_point = action.get("target_point") if isinstance(action.get("target_point"), dict) else None
+        target_bbox = action.get("target_bbox") if isinstance(action.get("target_bbox"), dict) else None
+
+        point_x: float | None = None
+        point_y: float | None = None
+        if target_point is not None:
+            point_x = self._coerce_float(target_point.get("x"))
+            point_y = self._coerce_float(target_point.get("y"))
+        if point_x is None or point_y is None:
+            text_point = self._point_from_action_text(action.get("text"))
+            if text_point is not None:
+                point_x, point_y = text_point
+
+        box_x = box_y = box_width = box_height = None
+        if target_bbox is not None:
+            box_x = self._coerce_float(target_bbox.get("x"))
+            box_y = self._coerce_float(target_bbox.get("y"))
+            box_width = self._coerce_float(target_bbox.get("width"))
+            box_height = self._coerce_float(target_bbox.get("height"))
+            if box_width is not None and box_width <= 0:
+                box_width = None
+            if box_height is not None and box_height <= 0:
+                box_height = None
+
+        has_point = point_x is not None and point_y is not None
+        has_box = (
+            box_x is not None
+            and box_y is not None
+            and box_width is not None
+            and box_height is not None
+        )
+        if not has_point and not has_box:
+            return ""
+
+        pieces: list[str] = [
+            "<div style='position:absolute;top:0;left:0;right:0;bottom:0;pointer-events:none;'>"
+        ]
+
+        if has_box:
+            box_left = max(0.0, min(100.0, (box_x / image_width) * 100.0))
+            box_top = max(0.0, min(100.0, (box_y / image_height) * 100.0))
+            box_w_pct = max(0.0, min(100.0, (box_width / image_width) * 100.0))
+            box_h_pct = max(0.0, min(100.0, (box_height / image_height) * 100.0))
+            pieces.append(
+                "<div style='position:absolute;"
+                f"left:{box_left:.3f}%;top:{box_top:.3f}%;"
+                f"width:{box_w_pct:.3f}%;height:{box_h_pct:.3f}%;"
+                "border:2px solid #2563eb;background:rgba(37,99,235,0.14);"
+                "border-radius:8px;box-sizing:border-box;'></div>"
+            )
+
+        label_text = str(
+            action.get("annotation_label")
+            or action.get("why")
+            or action.get("kind")
+            or ""
+        ).strip()
+
+        if has_point:
+            point_left = max(0.0, min(100.0, (point_x / image_width) * 100.0))
+            point_top = max(0.0, min(100.0, (point_y / image_height) * 100.0))
+            pieces.append(
+                "<div style='position:absolute;"
+                f"left:{point_left:.3f}%;top:{point_top:.3f}%;"
+                "width:14px;height:14px;transform:translate(-50%,-50%);"
+                "border:2px solid #0f172a;background:#f8fafc;border-radius:999px;"
+                "box-shadow:0 0 0 3px rgba(37,99,235,0.35);'></div>"
+            )
+            pieces.append(
+                "<div style='position:absolute;"
+                f"left:{point_left:.3f}%;top:{point_top:.3f}%;"
+                "width:1px;height:26px;background:rgba(15,23,42,0.65);"
+                "transform:translate(-50%,-50%);'></div>"
+            )
+            pieces.append(
+                "<div style='position:absolute;"
+                f"left:{point_left:.3f}%;top:{point_top:.3f}%;"
+                "width:26px;height:1px;background:rgba(15,23,42,0.65);"
+                "transform:translate(-50%,-50%);'></div>"
+            )
+
+            if label_text:
+                label_top = max(2.0, point_top - 6.0)
+                pieces.append(
+                    "<div style='position:absolute;"
+                    f"left:{point_left:.3f}%;top:{label_top:.3f}%;"
+                    "transform:translate(-50%,-100%);"
+                    "background:rgba(15,23,42,0.92);color:#ffffff;font-size:11px;"
+                    "line-height:1.2;padding:4px 8px;border-radius:6px;max-width:260px;"
+                    "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;'>"
+                    f"{escape(label_text)}</div>"
+                )
+        elif has_box and label_text:
+            label_left = max(0.0, min(100.0, (box_x / image_width) * 100.0))
+            label_top = max(1.0, min(98.0, (box_y / image_height) * 100.0))
+            pieces.append(
+                "<div style='position:absolute;"
+                f"left:{label_left:.3f}%;top:{label_top:.3f}%;"
+                "transform:translateY(-100%);"
+                "background:rgba(15,23,42,0.92);color:#ffffff;font-size:11px;"
+                "line-height:1.2;padding:4px 8px;border-radius:6px;max-width:260px;"
+                "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;'>"
+                f"{escape(label_text)}</div>"
+            )
+
+        pieces.append("</div>")
+        return "".join(pieces)
+
+    @staticmethod
+    def _coerce_float(value) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _point_from_action_text(value) -> tuple[float, float] | None:
+        if not isinstance(value, str):
+            return None
+        parts = [part.strip() for part in value.split(",")]
+        if len(parts) != 2:
+            return None
+        try:
+            return float(parts[0]), float(parts[1])
+        except ValueError:
+            return None
 
     def _render_runtime_action(self, payload: dict | None) -> None:
         action = payload.get("recommended_action") if isinstance(payload, dict) else None
